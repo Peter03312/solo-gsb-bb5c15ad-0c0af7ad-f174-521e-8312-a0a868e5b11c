@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→事件预演/确认→修订/变更查询→班次快照→现场对账→费率发布→停机损失核算→按批次分摊停机成本→按设备期间停机损失结账 全流程。# 计划保养提交与核对
+# 冒烟脚本：走完 设备→班次→事件→幂等/冲突→结算→迟到更正→现场裁定/撤销→断网批量补传→事件预演/确认→修订/变更查询→班次快照→现场对账→费率发布→停机损失核算→按批次分摊停机成本→按设备期间停机损失结账→金额越界保护（AMOUNT_OVERFLOW）→计划保养提交与核对 全流程。
 # 用法：./scripts/smoke.sh [BASE_URL]   （默认 http://localhost:8000）
 set -euo pipefail
 
@@ -322,6 +322,66 @@ req POST /devices/CNC-01/loss-closings '{"device_id":"CNC-01","closing_no":"LC-S
 req POST /devices/CNC-01/loss-closings '{"device_id":"CNC-01","closing_no":"LC-SMOKE-BAD2","start":"2026-10-01T00:00:00+08:00","end":"2026-10-03T00:00:00+08:00","seq":1,"rate_version":999}'
 req GET /loss-closings/NOPE
 req POST /devices/CNC-01/loss-closings '{"device_id":"CNC-01","closing_no":"LC-SMOKE-BAD3","start":"2026-10-03T00:00:00+08:00","end":"2026-10-01T00:00:00+08:00","seq":1,"rate_version":1}'
+
+echo "-- 金额越界保护：合法上限费率（12 位整数+6 位小数）照常发布，预期 201 version=3 --"
+req POST /devices/CNC-01/rate-versions '{"entries":[
+  {"reason":"failure","start":"2027-01-01T00:00:00Z","end":"2027-12-01T00:00:00Z","amount_per_minute":"999999999999.999999"}]}'
+
+echo "-- 长班次 92234 分钟（2027-01-01 至 2027-03-06T01:14Z）整班故障并结算 --"
+req POST /shifts '{"device_id":"CNC-01","start":"2027-01-01T00:00:00Z","end":"2027-03-06T01:14:00Z"}'
+req POST /events '{"device_id":"CNC-01","source_id":"GW-3","version":1,"start":"2027-01-01T00:00:00Z","end":"2027-03-06T01:14:00Z","reason":"failure"}'
+req POST /shifts/3/settle
+
+echo "-- 单段金额越界（92234 分钟 × 上限费率 = 9223399999999999991 分 > 2^63-1）：预期 422 AMOUNT_OVERFLOW --"
+req POST /shifts/3/loss-accountings '{"rate_version":3}'
+
+echo "-- 整笔回滚：班次 3 账列表为空；同组合重试仍是 422（不留部分账/明细）--"
+req GET /shifts/3/loss-accountings
+req POST /shifts/3/loss-accountings '{"rate_version":3}'
+
+echo "-- 边界内精确保存：92233 分钟班次合计 9223299999999999991 分（恰在界内），预期 201 不截断不饱和 --"
+req POST /shifts '{"device_id":"CNC-01","start":"2027-04-01T00:00:00Z","end":"2027-06-04T01:13:00Z"}'
+req POST /events '{"device_id":"CNC-01","source_id":"GW-4","version":1,"start":"2027-04-01T00:00:00Z","end":"2027-06-04T01:13:00Z","reason":"failure"}'
+req POST /shifts/4/settle
+req POST /shifts/4/loss-accountings '{"rate_version":3}'
+
+echo "-- 同组合重试：预期 200 幂等，金额逐字节一致 --"
+req POST /shifts/4/loss-accountings '{"rate_version":3}'
+
+echo "-- 两个 50000 分钟班次（各自核算在界内，各 4999999999999999995 分）--"
+req POST /shifts '{"device_id":"CNC-01","start":"2027-07-01T00:00:00Z","end":"2027-08-04T17:20:00Z"}'
+req POST /events '{"device_id":"CNC-01","source_id":"GW-5","version":1,"start":"2027-07-01T00:00:00Z","end":"2027-08-04T17:20:00Z","reason":"failure"}'
+req POST /shifts/5/settle
+req POST /shifts '{"device_id":"CNC-01","start":"2027-09-01T00:00:00Z","end":"2027-10-05T17:20:00Z"}'
+req POST /events '{"device_id":"CNC-01","source_id":"GW-6","version":1,"start":"2027-09-01T00:00:00Z","end":"2027-10-05T17:20:00Z","reason":"failure"}'
+req POST /shifts/6/settle
+
+CLOSING_SEQ2="$(curl -sS "$BASE/changes?cursor=0&limit=500" | python3 -c 'import sys,json;print(json.load(sys.stdin)["next_cursor"])')"
+echo "-- 多班次结账汇总越界（合计 9999999999999999990 分 > 2^63-1）：预期 422 AMOUNT_OVERFLOW，整单回滚 --"
+req POST /devices/CNC-01/loss-closings "{
+  \"device_id\":\"CNC-01\",\"closing_no\":\"LC-SMOKE-OVER\",
+  \"start\":\"2027-07-01T00:00:00Z\",\"end\":\"2027-11-01T00:00:00Z\",
+  \"seq\":$CLOSING_SEQ2,\"rate_version\":3}"
+
+echo "-- 不留痕：结账 404、两班账列表为空；失败的结账不占用单号 --"
+req GET /loss-closings/LC-SMOKE-OVER
+req GET /shifts/5/loss-accountings
+req GET /shifts/6/loss-accountings
+
+echo "-- 发布更低费率（版本 4：1 元/分）后同单号重新结账：预期 201 --"
+req POST /devices/CNC-01/rate-versions '{"entries":[
+  {"reason":"failure","start":"2027-01-01T00:00:00Z","end":"2027-12-01T00:00:00Z","amount_per_minute":"1"}]}'
+req POST /devices/CNC-01/loss-closings "{
+  \"device_id\":\"CNC-01\",\"closing_no\":\"LC-SMOKE-OVER\",
+  \"start\":\"2027-07-01T00:00:00Z\",\"end\":\"2027-11-01T00:00:00Z\",
+  \"seq\":$CLOSING_SEQ2,\"rate_version\":4}"
+
+echo "-- 同单号同输入重试：预期 200 幂等，返回原结账 --"
+req POST /devices/CNC-01/loss-closings "{
+  \"device_id\":\"CNC-01\",\"closing_no\":\"LC-SMOKE-OVER\",
+  \"start\":\"2027-07-01T00:00:00Z\",\"end\":\"2027-11-01T00:00:00Z\",
+  \"seq\":$CLOSING_SEQ2,\"rate_version\":4}"
+
 
 echo "-- 计划保养核对：提交计划单（多窗口、非整点排序），期间 10/1 全天 --"
 req POST /devices/CNC-01/maintenance-plans '{"device_id":"CNC-01","plan_no":"MP-SMOKE-001","start":"2026-10-01T00:00:00+08:00","end":"2026-10-02T00:00:00+08:00","windows":[

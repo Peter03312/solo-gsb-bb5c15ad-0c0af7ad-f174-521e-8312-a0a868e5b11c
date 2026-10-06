@@ -13,6 +13,10 @@ from app.closing import (  # noqa: E402
     empty_totals,
     summarize,
 )
+from app.pricing import (  # noqa: E402
+    MAX_STORED_AMOUNT_CENTS,
+    AmountOverflowError,
+)
 
 
 def _reason(p=0, c=0, u=0):
@@ -121,6 +125,47 @@ def test_summarize_rejects_negative():
         pass
     else:  # pragma: no cover
         raise AssertionError("expected ValueError on negative totals")
+
+
+# ---------------------------------------------------------------- 金额越界（BIGINT 金额列）
+
+
+def _big_account(cents: int) -> AccountSummary:
+    """单班次大额账：总额与 by_reason 明细一致（故障原因）。"""
+    return AccountSummary(
+        total_cents=cents,
+        priced_minutes=1,
+        unpriced_minutes=0,
+        by_reason={"failure": _reason(p=1, c=cents)},
+    )
+
+
+def test_summarize_total_at_bound_fits_exactly():
+    # 两笔账合计恰为 2^63 - 1 分：边界内精确保存，不截断、不饱和
+    a = _big_account(MAX_STORED_AMOUNT_CENTS - 1)
+    b = _big_account(1)
+    t = summarize([a, b])
+    assert t.total_cents == MAX_STORED_AMOUNT_CENTS
+    assert t.by_reason["failure"].amount_cents == MAX_STORED_AMOUNT_CENTS
+
+
+def test_summarize_total_overflow_rejected():
+    # 多班次汇总越界：两笔各约 5×10^18 分的账（单笔均在界内），
+    # 合计 9999999999999999990 > 2^63 - 1 → 整单拒绝
+    a = _big_account(4999999999999999995)
+    b = _big_account(4999999999999999995)
+    try:
+        summarize([a, b])
+    except AmountOverflowError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("expected AmountOverflowError for oversized total")
+
+
+def test_summarize_single_account_at_bound_fits():
+    # 单笔账本身即 2^63 - 1 分：合法（该账在核算时已通过边界校验）
+    t = summarize([_big_account(MAX_STORED_AMOUNT_CENTS)])
+    assert t.total_cents == MAX_STORED_AMOUNT_CENTS
 
 
 if __name__ == "__main__":

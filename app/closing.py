@@ -8,7 +8,10 @@
 - 定价分钟、待定价分钟分别相加；三类原因（保养/故障/待判）恒列出，
   无任何账时为全 0 的空汇总（空结账）；
 - 结账不重新计价，只汇总既有账：形成或复用损失账的逐段计价与待定价规则
-  完全沿用 pricing.price_segments。
+  完全沿用 pricing.price_segments；
+- 多班次汇总可能越过 BIGINT 金额列上限（pricing.MAX_STORED_AMOUNT_CENTS）：
+  越界即抛 AmountOverflowError，整单拒绝并回滚（不留部分账或结账），
+  不截断、不饱和；按原因金额均为非负且不超过总额，总额校验即覆盖。
 
 本模块只依赖标准库，可脱离 Web/数据库独立测试。
 """
@@ -18,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .attribution import REASONS
+from .pricing import MAX_STORED_AMOUNT_CENTS, AmountOverflowError
 
 
 @dataclass(frozen=True)
@@ -67,12 +71,15 @@ def summarize(accounts: list[AccountSummary]) -> ClosingTotals:
     """把多份损失账合计机械汇总为整单合计（不重新计价、不二次取整）。
 
     同时校验各账头标量与其 by_reason 明细之和一致（防御固化数据异常）。
+    累计总额越过 BIGINT 金额列上限（MAX_STORED_AMOUNT_CENTS）即抛
+    AmountOverflowError：整单拒绝并回滚，不截断、不饱和；按原因金额
+    非负且不超过总额，总额校验即覆盖各原因汇总。
     """
     totals = {r: ReasonTotal(reason=r) for r in REASONS}
     total_cents = 0
     total_priced = 0
     total_unpriced = 0
-    for acc in accounts:
+    for item_no, acc in enumerate(accounts, start=1):
         if acc.total_cents < 0 or acc.priced_minutes < 0 or acc.unpriced_minutes < 0:
             raise ValueError("loss accounting totals must be non-negative")
         sum_cents = 0
@@ -104,6 +111,13 @@ def summarize(accounts: list[AccountSummary]) -> ClosingTotals:
                 "loss accounting header totals do not match the sum of by_reason rows"
             )
         total_cents += acc.total_cents
+        if total_cents > MAX_STORED_AMOUNT_CENTS:
+            raise AmountOverflowError(
+                f"closing total exceeds the storable maximum of "
+                f"{MAX_STORED_AMOUNT_CENTS} cents (BIGINT) while accumulating "
+                f"loss accounting #{item_no} of {len(accounts)}; the closing "
+                "is refused and rolled back",
+            )
         total_priced += acc.priced_minutes
         total_unpriced += acc.unpriced_minutes
     return ClosingTotals(

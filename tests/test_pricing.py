@@ -10,7 +10,9 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.pricing import (  # noqa: E402
+    MAX_STORED_AMOUNT_CENTS,
     AmountError,
+    AmountOverflowError,
     FrozenSegment,
     RateLine,
     RateTableError,
@@ -356,6 +358,73 @@ def test_pricing_rates_outside_segment_fully_unpriced():
     assert result.total_cents == 0
     assert result.unpriced_minutes == 60
     assert len(result.unpriced) == 1
+
+
+# ---------------------------------------------------------------- 金额越界（BIGINT 金额列）
+
+#: 合法费率上限：12 位整数 + 6 位小数（本身恒在 BIGINT 内，发布不被拒绝）
+MAX_RATE = "999999999999.999999"
+
+
+def test_pricing_piece_amount_within_bound_stored_exactly():
+    # 92233 分钟 × 合法上限费率 = 9223299999999999991 分，恰在 BIGINT 内：
+    # 精确保存，不截断、不饱和
+    result = price_segments(
+        [seg(1, t(0), t(0, 92233), "failure")],
+        [line("failure", t(0), t(0, 92233), MAX_RATE)],
+    )
+    assert len(result.priced) == 1
+    assert result.priced[0].amount_cents == 9223299999999999991
+    assert result.total_cents == 9223299999999999991
+    assert result.total_cents <= MAX_STORED_AMOUNT_CENTS
+
+
+def test_pricing_piece_amount_overflow_rejected():
+    # 再多 1 分钟（92234）：段金额 9223399999999999991 分 > 2^63 - 1 → 越界
+    try:
+        price_segments(
+            [seg(1, t(0), t(0, 92234), "failure")],
+            [line("failure", t(0), t(0, 92234), MAX_RATE)],
+        )
+    except AmountOverflowError:
+        pass
+    else:
+        raise AssertionError("expected AmountOverflowError for oversized piece")
+
+
+def test_pricing_total_overflow_across_pieces_rejected():
+    # 两段各 50000 分钟：单段 4999999999999999995 分均在界内，
+    # 合计 9999999999999999990 分越界 → 整笔拒绝
+    try:
+        price_segments(
+            [seg(1, t(0), t(0, 100000), "failure")],
+            [
+                line("failure", t(0), t(0, 50000), MAX_RATE),
+                line("failure", t(0, 50000), t(0, 100000), MAX_RATE),
+            ],
+        )
+    except AmountOverflowError:
+        pass
+    else:
+        raise AssertionError("expected AmountOverflowError for oversized total")
+
+
+def test_pricing_total_at_bound_across_pieces_fits():
+    # 两段合计恰为 2^63 - 1 分：边界内精确保存（直接构造微元费率行，
+    # 聚焦 price_segments 的边界判定而非发布入口的位数校验）
+    half = MAX_STORED_AMOUNT_CENTS // 2  # 4611686018427387903
+    result = price_segments(
+        [
+            seg(1, t(0), t(0, 1), "failure"),
+            seg(2, t(0, 1), t(0, 2), "failure"),
+        ],
+        [
+            RateLine("failure", t(0), t(0, 1), half * 10**4),
+            RateLine("failure", t(0, 1), t(0, 2), (half + 1) * 10**4),
+        ],
+    )
+    assert [p.amount_cents for p in result.priced] == [half, half + 1]
+    assert result.total_cents == MAX_STORED_AMOUNT_CENTS
 
 
 if __name__ == "__main__":

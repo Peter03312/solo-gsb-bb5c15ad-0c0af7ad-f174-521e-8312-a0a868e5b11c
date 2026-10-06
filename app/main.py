@@ -933,7 +933,9 @@ def account_shift_loss_route(
     - 未知班次 404 SHIFT_NOT_FOUND、未结算 404 RESULT_NOT_FOUND、
       未知修订 404 REVISION_NOT_FOUND、该设备未知费率版本
       404 RATE_VERSION_NOT_FOUND；修订无固化明细（结构引入前的历史修订）
-      → 422 SEGMENTS_UNAVAILABLE，不以当前状态推算。
+      → 422 SEGMENTS_UNAVAILABLE，不以当前状态推算；任一切分段金额或
+      账合计越过 BIGINT 金额列上限 → 422 AMOUNT_OVERFLOW，整笔回滚
+      （不留下部分账或明细；边界内金额精确保存，不截断、不饱和）。
     """
     accounting, pieces, created = services.account_shift_loss(
         db, shift_id, payload.rate_version, payload.revision
@@ -1283,6 +1285,9 @@ def close_device_loss_period_route(
       同单号异输入（设备/期间/序号/费率版本不同）→ 409 CLOSING_CONFLICT；
     - 序号越界 422 INVALID_SEQ、未知设备 404 DEVICE_NOT_FOUND、该设备未知
       费率版本 404 RATE_VERSION_NOT_FOUND、非法期间 422 VALIDATION_ERROR；
+    - 任一纳入账的明细/账头金额或整单汇总越过 BIGINT 金额列上限 →
+      422 AMOUNT_OVERFLOW，整单回滚（同事务新形成的账一并撤销，不留下
+      部分账、明细或结账；失败的结账不占用单号）；
     - 结账固化后，后续事件更正、费率发布与重新核算只产生新修订/新账，
       **历史结账及其引用永不改变**。
     """

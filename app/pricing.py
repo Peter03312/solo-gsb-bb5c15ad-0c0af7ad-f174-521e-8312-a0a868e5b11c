@@ -14,6 +14,14 @@
   段金额按「分」四舍五入（0.5 分向上，ROUND_HALF_UP），得「分」整数；
 - 合计 = 各段「分」整数之和（先逐段取整、再汇总，绝不先汇总后取整）。
 
+金额越界规则（BIGINT 金额列）
+- 段金额与账合计（分）写入数据库 BIGINT 列，可承载上限为 2^63 - 1 分；
+  长班次逐段核算的段金额或合计可能越过该界；
+- 任一段金额或累计合计越界即抛 AmountOverflowError：调用方据此整笔拒绝
+  并回滚（不留下部分账或明细），绝不截断、绝不饱和写入；
+- 合法费率（最多 12 位整数 + 6 位小数，本身恒在 BIGINT 内）不因"未来
+  可能越界"而被拒绝：越界判定只发生在逐段核算/汇总的实际金额上。
+
 核算规则
 - 输入为某修订**固化**的归因段（与 attribution.attribute_segments 同形态：
   整分钟半开区间 + 原因，按起点排序、互不重叠，只含停机分钟）；
@@ -42,10 +50,22 @@ _AMOUNT_RE = re.compile(r"^\d+(?:\.\d+)?$")
 #: 整数位数上限（10^12 元/分钟）：与 BIGINT 定点存储及「费率 × 分钟数」
 #: 的中间积相容，超出视为非法输入而不是让数据库溢出。
 MAX_AMOUNT_INTEGER_DIGITS = 12
+#: 金额列（分）可承载的最大值：数据库 BIGINT 上限 2^63 - 1。
+#: 逐段取整后的段金额、账头合计与结账汇总（分）均不得越过该界；
+#: 越界即整笔拒绝（AmountOverflowError），不截断、不饱和。
+MAX_STORED_AMOUNT_CENTS = 2**63 - 1
 
 
 class AmountError(ValueError):
     """金额字符串非法（空、非数字、负号/指数、多于 6 位小数等）。"""
+
+
+class AmountOverflowError(OverflowError):
+    """金额越界：逐段取整后的段金额或累计合计超出 BIGINT 金额列上限。
+
+    与 AmountError（输入非法）不同：触发越界的费率与班次本身均合法，
+    只是本次核算/汇总的实际金额结果超出可存储范围，调用方应整笔回滚。
+    """
 
 
 class RateTableError(ValueError):
@@ -237,6 +257,8 @@ def price_segments(
     segments 按起点排序、互不重叠（固化明细的既有约定）；lines 已通过
     validate_rate_lines 校验。同一固化段被该原因费率行的边界切成多个
     定价段与待定价间隙；每个定价段独立取整后再汇总。
+    任一段金额或累计合计越过 MAX_STORED_AMOUNT_CENTS（BIGINT 上限）即抛
+    AmountOverflowError，调用方整笔拒绝并回滚，不截断、不饱和。
     """
     # 假设输入均已对齐整分钟；按原因分组费率行并按起点排序（同原因互不重叠）
     by_reason: dict[str, list[RateLine]] = {r: [] for r in REASONS}
@@ -289,6 +311,13 @@ def price_segments(
             amount_cents = round_micro_to_cents_half_up(
                 line.amount_per_minute * minutes
             )
+            if amount_cents > MAX_STORED_AMOUNT_CENTS:
+                raise AmountOverflowError(
+                    f"priced piece [{lo.isoformat()}, {hi.isoformat()}) amounts "
+                    f"to {amount_cents} cents, exceeding the storable maximum "
+                    f"of {MAX_STORED_AMOUNT_CENTS} cents (BIGINT); the "
+                    "operation is refused and rolled back",
+                )
             priced.append(
                 PricedPiece(
                     piece_no=piece_no,
@@ -302,6 +331,13 @@ def price_segments(
                 )
             )
             total_cents += amount_cents
+            if total_cents > MAX_STORED_AMOUNT_CENTS:
+                raise AmountOverflowError(
+                    f"accounting total exceeds the storable maximum of "
+                    f"{MAX_STORED_AMOUNT_CENTS} cents (BIGINT) while "
+                    f"accumulating piece [{lo.isoformat()}, {hi.isoformat()}); "
+                    "the operation is refused and rolled back",
+                )
             total_priced_minutes += minutes
             rt = totals[seg.reason]
             totals[seg.reason] = ReasonTotal(

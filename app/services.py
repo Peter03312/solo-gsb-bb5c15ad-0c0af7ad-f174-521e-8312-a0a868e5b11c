@@ -1839,7 +1839,12 @@ def _get_or_create_accounting(
         )
         for s in seg_rows
     ]
-    result = pricing.price_segments(frozen, lines)
+    try:
+        result = pricing.price_segments(frozen, lines)
+    except pricing.AmountOverflowError as exc:
+        # 段金额或账合计越过 BIGINT 金额列：整笔拒绝（调用方回滚事务，
+        # 不留下部分账或明细）；边界内金额精确保存，不截断、不饱和。
+        raise ApiError(422, "AMOUNT_OVERFLOW", str(exc)) from exc
 
     accounting = LossAccounting(
         shift_id=shift_id,
@@ -1916,7 +1921,9 @@ def account_shift_loss(
       原子、历史版本不可变，锁不阻塞新版本发布，但保证本次核算全程引用
       同一完整版本，不会读到发布中的半成品；
     - 修订无固化明细（结构引入前的历史修订）明确拒绝，绝不以当前状态推算；
-    - 账与明细同事务写入；历史账不可改写，后续发布/更正只产生新组合的账。
+    - 账与明细同事务写入；历史账不可改写，后续发布/更正只产生新组合的账；
+    - 任一切分段金额或账合计越过 BIGINT 金额列上限 → 422 AMOUNT_OVERFLOW，
+      整笔回滚（不留下部分账或明细）；边界内金额精确保存，不截断、不饱和。
     """
     shift = db.execute(
         select(Shift).where(Shift.id == shift_id).with_for_update()
@@ -2380,7 +2387,10 @@ def close_device_loss_period(
     - 无符合班次时固化一张空结账（条目为空、金额/分钟全 0）；
     - 同单号同输入重试返回原结账（200，idempotent=true）；同单号异输入
       409 CLOSING_CONFLICT；序号越界 422 INVALID_SEQ、未知设备 404、
-      该设备未知费率版本 404 RATE_VERSION_NOT_FOUND。
+      该设备未知费率版本 404 RATE_VERSION_NOT_FOUND；
+    - 任一纳入账的切分段/账头金额或整单汇总越过 BIGINT 金额列上限 →
+      422 AMOUNT_OVERFLOW，整单回滚（同事务新形成的账一并撤销，不留下
+      部分账、明细或结账）；失败的结账不占用单号，修正费率后可同单号重试。
     """
     device = get_device_or_404(db, payload.device_id)
     win_start, win_end = _utc(payload.start), _utc(payload.end)
@@ -2531,7 +2541,12 @@ def close_device_loss_period(
             db.add(item)
             item_rows.append((item, locked, accounting, pieces))
 
-        totals = closing.summarize(account_summaries)
+        try:
+            totals = closing.summarize(account_summaries)
+        except pricing.AmountOverflowError as exc:
+            # 多班次汇总越过 BIGINT 金额列：整单拒绝（下方 except ApiError
+            # 统一回滚，不留下部分新账或结账记录）。
+            raise ApiError(422, "AMOUNT_OVERFLOW", str(exc)) from exc
         head.total_cents = totals.total_cents
         head.priced_minutes = totals.priced_minutes
         head.unpriced_minutes = totals.unpriced_minutes
