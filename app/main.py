@@ -1,0 +1,1478 @@
+"""HTTP API 入口。"""
+
+from __future__ import annotations
+
+from contextlib import asynccontextmanager
+from datetime import datetime
+
+from fastapi import Depends, FastAPI, Query, Request, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
+
+from . import services
+from .db import get_db, init_db
+from .models import Shift, ShiftResult
+from .schemas import (
+    AdjudicationAck,
+    AdjudicationIn,
+    AdjudicationOut,
+    AllocationAccountResult,
+    AllocationDestination,
+    AllocationReasonTotal,
+    AllocationSplitOut,
+    BatchWindowIn,
+    ChangeEntry,
+    ChangePage,
+    ClosingItemOut,
+    ClosingReasonTotal,
+    ClosingTotals,
+    DeviceCreate,
+    DeviceOut,
+    EventAccepted,
+    EventBatchAccepted,
+    EventBatchIn,
+    EventBatchItemAck,
+    EventConfirmIn,
+    EventIn,
+    EventPreviewOut,
+    EventVersionRef,
+    LossAccountingIn,
+    LossAccountingOut,
+    LossCostAllocationIn,
+    LossCostAllocationOut,
+    LossPeriodClosingIn,
+    LossPeriodClosingOut,
+    LossReasonTotal,
+    LossTotal,
+    MaintenanceCheckOut,
+    MaintenanceInterval,
+    MaintenancePlanIn,
+    MaintenancePlanOut,
+    MaintenanceShiftBasis,
+    MaintenanceWindowOut,
+    PricedPieceOut,
+    RateEntryOut,
+    RateVersionDetailOut,
+    RateVersionIn,
+    RateVersionOut,
+    RateVersionPublishedOut,
+    ReasonMinutes,
+    RecomputedShift,
+    ReconciledShiftRef,
+    ReconciliationIn,
+    ReconciliationInterval,
+    ReconciliationOut,
+    ResultOut,
+    ResultSegmentOut,
+    ResultSegmentsOut,
+    RevisionRef,
+    SettleResponse,
+    ShiftCreate,
+    ShiftImpactPreview,
+    ShiftOut,
+    ShiftSnapshotEntry,
+    ShiftSnapshotPage,
+    UnpricedPieceOut,
+    _check_ts,
+)
+from .pricing import format_cents, format_micro
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()  # 建库建表（含排他约束），并等待数据库就绪
+    yield
+
+
+app = FastAPI(
+    title="设备停机归因服务",
+    version="1.11.0",
+    description=(
+        "按班次对设备停机时间进行归因（保养/故障/待判）。"
+        "区间均为半开 [start, end)；重叠时保养 > 故障 > 待判，每分钟只归因一次；"
+        "事件按 (来源, 连续版本) 上报，支持幂等与迟到更正重算；"
+        "上报前可经 POST /events/preview 只读预演候选版本对已结算班次的影响，"
+        "再凭确认凭据经 POST /events/confirm 原子提交（状态已变则拒绝并要求重新预演）；"
+        "现场网关断网恢复后可经 POST /events/batch 整批补传同一设备的事件列表"
+        "（全或无：逐项核对版本链，任一非法整批失败）；"
+        "已结算班次支持现场人工裁定（提交/按单号撤销），裁定覆盖自动事件归因，"
+        "撤销后回退；仅当各原因分钟数变化时追加班次修订并进入全局游标变更流；"
+        "GET /changes 提供按全局递增游标分页的结算/更正/裁定变更流，供下游报表同步；"
+        "GET /devices/{device_id}/shift-snapshots 提供按固定变更序号的班次归因快照，"
+        "供下游报表首次接入或重建索引；"
+        "GET /shifts/{shift_id}/result/segments 提供与修订同事务固化的不可变归因区间"
+        "明细（按起点排序、互不重叠的半开区间，含起止、原因及依据），"
+        "历史修订未固化明细时明确返回不可用；"
+        "POST /devices/{device_id}/downtime-reconciliation 按固定变更序号对账现场"
+        "停机记录与系统已结算归因（仅在已结算班次覆盖分钟比较，差异与未对账"
+        "分钟分别给出最大连续区间，结果携带所用序号以便重放）；"
+        "POST /devices/{device_id}/rate-versions 按设备原子发布费率版本或复用同内容版本"
+        "（每行含原因、整分钟半开生效区间与非负每分钟金额，同版本同原因区间不重叠；"
+        "等价时区、行换序、相同金额写法不产生重复版本），"
+        "POST /shifts/{shift_id}/loss-accountings 对已结算班次指定修订与费率版本"
+        "核算停机损失：以修订固化归因段按费率边界切分，定点数逐段四舍五入到分后"
+        "汇总，未匹配费率的分钟单列待定价（不作零金额）；结果按"
+        "（班次, 修订, 费率版本）幂等固化，历史账不可改写；"
+        "POST /devices/{device_id}/loss-cost-allocations 按生产批次追溯停机成本："
+        "提交同一设备的分摊单号、已固化损失账 id 列表与一批批次号-整分钟半开"
+        "生产窗口（每班次至多一份账、批次窗口互不重叠），按账内定价/待定价明细"
+        "与窗口的交集分摊分钟，窗口外归未分配；定价明细整数分按交集占比"
+        "先取整再按余数降序补足（同余数批次号升序、未分配最后），待定价只分分钟；"
+        "结果固化各账各去向按原因汇总的分钟金额及来源明细，同单号同内容重试幂等、"
+        "异内容冲突，非法输入整单拒绝；"
+        "POST /devices/{device_id}/loss-closings 供财务按设备封存一个期间的停机"
+        "损失结账：输入结账单号、设备、带时区整分钟的半开期间、截止变更序号与"
+        "该设备已发布费率版本，只纳入期间内起始且截至该序号已有结算修订的班次，"
+        "按整班次取该序号前最后修订的固化归因段，沿用逐段计价与待定价规则形成或"
+        "复用损失账；整单同事务固化所选修订、账引用及按原因汇总，任一修订缺少"
+        "固化明细则整单失败，无符合班次固化空结账，同单号同输入重试返回原结账、"
+        "异输入冲突，历史结账不随后续更正/费率发布/重新核算改变；"
+        "POST /devices/{device_id}/maintenance-plans 供车间按设备提交计划保养单"
+        "（全局唯一单号、带时区整分钟半开期间与非空保养窗口；窗口在期间内且互不"
+        "重叠，同设备计划期间不重叠；提交后不可改，同单号同内容重试幂等——窗口"
+        "换序、等价时区仍算同内容，异内容冲突），GET /maintenance-plans/{plan_no}/check "
+        "按单号与可选全局变更序号核对：缺省固定查询开始时最新序号，只取序号不大于"
+        "该值的已结算班次最后修订及固化归因段，窗口∩保养段计已执行、窗口内已结算"
+        "非保养分钟计未执行、期间内窗口外保养计计划外、窗口未被已结算班次覆盖分钟"
+        "单列未核实（不计未执行），返回各类最大连续半开区间、分钟汇总、所用序号与"
+        "班次修订依据；未知设备/单号、越过最新序号明确报错，所需历史修订缺固化段"
+        "整次查询报不可用，不以现态推算。"
+    ),
+    lifespan=lifespan,
+)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(request: Request, exc: RequestValidationError):
+    """统一参数校验错误格式（非法区间、缺时区、未对齐整分钟等）。"""
+    errors = exc.errors()
+    message = "; ".join(
+        f"{'.'.join(str(p) for p in e.get('loc', []) if p != 'body')}: {e.get('msg')}"
+        .lstrip(": ")
+        for e in errors
+    )
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": {
+                "code": "VALIDATION_ERROR",
+                "message": message or "invalid request",
+                "errors": jsonable_encoder(errors, custom_encoder={Exception: str}),
+            }
+        },
+    )
+
+
+def _result_out(shift: Shift, rev: ShiftResult, latest_revision: int) -> ResultOut:
+    return ResultOut(
+        shift_id=shift.id,
+        device_id=shift.device_id,
+        shift_start=shift.start_ts,
+        shift_end=shift.end_ts,
+        revision=rev.revision,
+        latest_revision=latest_revision,
+        totals=ReasonMinutes(
+            maintenance=rev.maintenance_minutes,
+            failure=rev.failure_minutes,
+            pending=rev.pending_minutes,
+        ),
+        delta=ReasonMinutes(
+            maintenance=rev.d_maintenance,
+            failure=rev.d_failure,
+            pending=rev.d_pending,
+        ),
+        event_versions=[EventVersionRef(**ev) for ev in rev.event_versions],
+        trigger=rev.trigger,
+        created_at=rev.created_at,
+    )
+
+
+@app.get("/health", tags=["meta"])
+def health():
+    return {"status": "ok"}
+
+
+# ---------------------------------------------------------------- 设备
+
+
+@app.post("/devices", response_model=DeviceOut, tags=["devices"])
+def create_device(
+    payload: DeviceCreate, response: Response, db: Session = Depends(get_db)
+):
+    """注册设备；重复提交同 id 设备幂等返回（200）。"""
+    device, created = services.create_device(db, payload)
+    response.status_code = 201 if created else 200
+    return DeviceOut(id=device.id, name=device.name)
+
+
+@app.get("/devices", response_model=list[DeviceOut], tags=["devices"])
+def list_devices(db: Session = Depends(get_db)):
+    return [DeviceOut(id=d.id, name=d.name) for d in services.list_devices(db)]
+
+
+# ---------------------------------------------------------------- 班次
+
+
+@app.post("/shifts", response_model=ShiftOut, status_code=201, tags=["shifts"])
+def create_shift(payload: ShiftCreate, db: Session = Depends(get_db)):
+    """创建班次（半开区间，同设备不可重叠）。"""
+    shift = services.create_shift(db, payload)
+    return ShiftOut(
+        id=shift.id,
+        device_id=shift.device_id,
+        start=shift.start_ts,
+        end=shift.end_ts,
+    )
+
+
+@app.get("/shifts/{shift_id}", response_model=ShiftOut, tags=["shifts"])
+def get_shift(shift_id: int, db: Session = Depends(get_db)):
+    shift = services.get_shift_or_404(db, shift_id)
+    return ShiftOut(
+        id=shift.id,
+        device_id=shift.device_id,
+        start=shift.start_ts,
+        end=shift.end_ts,
+    )
+
+
+@app.post(
+    "/shifts/{shift_id}/settle", response_model=SettleResponse, tags=["attribution"]
+)
+def settle_shift(shift_id: int, db: Session = Depends(get_db)):
+    """结算班次：按当前生效事件计算归因，写入修订 1；重复调用幂等返回最新修订。"""
+    shift, rev, created = services.settle_shift(db, shift_id)
+    return SettleResponse(
+        settled=created, result=_result_out(shift, rev, rev.revision)
+    )
+
+
+# ---------------------------------------------------------------- 事件
+
+
+def _recomputed_out(
+    recomputed: list[tuple[Shift, ShiftResult]],
+) -> list[RecomputedShift]:
+    return [
+        RecomputedShift(
+            shift_id=shift.id,
+            revision=rev.revision,
+            totals=ReasonMinutes(
+                maintenance=rev.maintenance_minutes,
+                failure=rev.failure_minutes,
+                pending=rev.pending_minutes,
+            ),
+            delta=ReasonMinutes(
+                maintenance=rev.d_maintenance,
+                failure=rev.d_failure,
+                pending=rev.d_pending,
+            ),
+        )
+        for shift, rev in recomputed
+    ]
+
+
+@app.post("/events", response_model=EventAccepted, tags=["events"])
+def ingest_event(
+    payload: EventIn, response: Response, db: Session = Depends(get_db)
+):
+    """上报停机事件版本。
+
+    - 同来源同版本同内容：幂等返回（200，idempotent=true）；
+    - 同版本异内容 / 跳号：409；
+    - 新版本（含迟到更正）：201，并按事件时间重算受影响的已结算班次，
+      在 recomputed 中返回新修订与差额。
+    """
+    ev, idempotent, recomputed = services.ingest_event(db, payload)
+    response.status_code = 200 if idempotent else 201
+    return EventAccepted(
+        device_id=ev.device_id,
+        source_id=ev.source_id,
+        version=ev.version,
+        idempotent=idempotent,
+        recomputed=_recomputed_out(recomputed),
+    )
+
+
+@app.post("/events/batch", response_model=EventBatchAccepted, tags=["events"])
+def ingest_event_batch(
+    payload: EventBatchIn, response: Response, db: Session = Depends(get_db)
+):
+    """现场网关断网恢复后的批量补传：同一设备的非空事件列表，整批核对、整批应用。
+
+    - 逐项沿用单条上报的字段与校验，按列表顺序核对每个来源的版本链：
+      已存在的同版本同内容项为幂等重试（回执 idempotent=true）；
+    - 同版本异内容 409 VERSION_CONFLICT、跳号 409 VERSION_GAP、
+      未知设备 404、任一项非法 422 —— 整批失败，不留下事件、修订或变更；
+    - 成功时先应用全部新版本，仅以批前和批后各来源最新版本的区间并集
+      确定受影响的已结算班次，再按最终状态重算：每班次最多一次修订和
+      一条变更，分钟数未变则都不产生；
+    - 全部项幂等时整体返回 200，否则 201。
+    """
+    acks, recomputed = services.ingest_event_batch(db, payload)
+    items = [EventBatchItemAck(**a) for a in acks]
+    response.status_code = 200 if all(a.idempotent for a in items) else 201
+    return EventBatchAccepted(
+        device_id=payload.device_id,
+        items=items,
+        recomputed=_recomputed_out(recomputed),
+    )
+
+
+@app.post("/events/preview", response_model=EventPreviewOut, tags=["events"])
+def preview_event(payload: EventIn, db: Session = Depends(get_db)):
+    """上报前只读预演：预览候选事件版本对已结算班次的影响。
+
+    - 字段、校验与版本链规则同单条上报：同版本同内容幂等（idempotent=true，
+      无影响）、同版本异内容 409 VERSION_CONFLICT、跳号 409 VERSION_GAP、
+      未知设备 404、非法输入 422；
+    - 以旧版与候选版区间并集找出相关已结算班次，按当前全部来源最新版本及
+      生效裁定计算各班次的现有分钟数、拟变分钟数与差额；结果不变的班次也
+      列出（changed=false）；
+    - 只读：不写入事件、修订或变更；返回的 confirm_token 供
+      POST /events/confirm 原样回传以原子提交。
+    """
+    idempotent, impacts, token = services.preview_event(db, payload)
+    return EventPreviewOut(
+        device_id=payload.device_id,
+        source_id=payload.source_id,
+        version=payload.version,
+        idempotent=idempotent,
+        confirm_token=token,
+        impacts=[ShiftImpactPreview(**i) for i in impacts],
+    )
+
+
+@app.post("/events/confirm", response_model=EventAccepted, tags=["events"])
+def confirm_event(
+    payload: EventConfirmIn, response: Response, db: Session = Depends(get_db)
+):
+    """凭预演确认凭据原子提交候选事件版本。
+
+    - 重新核对候选内容、来源版本链及影响结果的班次/事件/裁定状态，
+      任一已变 → 409 PREVIEW_STALE，不写入任何数据，需重新预演；
+    - 状态未变 → 201，同事务落库事件并沿用现有更正规则，仅为分钟数
+      变化的班次生成修订与变更（recomputed 中返回）；
+    - 相同确认重试遵循现有事件幂等语义（200，idempotent=true）；
+      同版本异内容 409 VERSION_CONFLICT、跳号 409 VERSION_GAP；
+    - 凭据伪造/篡改/损坏 → 422 INVALID_CONFIRM_TOKEN。
+    """
+    ev, idempotent, recomputed = services.confirm_event(db, payload.confirm_token)
+    response.status_code = 200 if idempotent else 201
+    return EventAccepted(
+        device_id=ev.device_id,
+        source_id=ev.source_id,
+        version=ev.version,
+        idempotent=idempotent,
+        recomputed=_recomputed_out(recomputed),
+    )
+
+
+# ---------------------------------------------------------------- 结果查询
+
+
+@app.get("/shifts/{shift_id}/result", response_model=ResultOut, tags=["attribution"])
+def get_result(
+    shift_id: int,
+    revision: int | None = Query(default=None, ge=1, description="指定修订号，缺省为最新"),
+    db: Session = Depends(get_db),
+):
+    """查询班次归因结果；可用 ?revision=N 查看历史修订（原结果永久保留）。"""
+    shift, rev, latest_revision = services.get_result(db, shift_id, revision)
+    return _result_out(shift, rev, latest_revision)
+
+
+@app.get(
+    "/shifts/{shift_id}/revisions", response_model=list[ResultOut], tags=["attribution"]
+)
+def list_revisions(shift_id: int, db: Session = Depends(get_db)):
+    """列出班次的全部修订（含每次更正的差额）。"""
+    shift, revs = services.list_revisions(db, shift_id)
+    latest_revision = revs[-1].revision if revs else 0
+    return [_result_out(shift, rev, latest_revision) for rev in revs]
+
+
+@app.get(
+    "/shifts/{shift_id}/result/segments",
+    response_model=ResultSegmentsOut,
+    tags=["attribution"],
+)
+def get_result_segments(
+    shift_id: int,
+    revision: int | None = Query(default=None, ge=1, description="指定修订号，缺省为最新"),
+    db: Session = Depends(get_db),
+):
+    """查询班次某修订的归因区间明细（解释各原因分钟数的构成）。
+
+    - 返回按起点排序、互不重叠的半开区间段，每段含起止、分钟数、原因及依据
+      （生效裁定单号，或该区间内决定此原因的事件来源与版本列表）；
+    - 只含停机分钟；各原因段分钟之和等于该修订的对应总数；
+    - 明细与修订同事务固化、不可变：事件更正或裁定撤销后旧修订明细保持原样；
+    - 本结构引入前生成的历史修订未固化明细：available=false 且 segments=null
+      （明确不可用，不以当前状态推算）；
+    - 未知班次 404 SHIFT_NOT_FOUND、未结算 404 RESULT_NOT_FOUND、
+      未知修订 404 REVISION_NOT_FOUND。
+    """
+    shift, rev, latest_revision, segments = services.get_result_segments(
+        db, shift_id, revision
+    )
+    if segments is None:
+        return ResultSegmentsOut(
+            shift_id=shift.id,
+            revision=rev.revision,
+            latest_revision=latest_revision,
+            available=False,
+            segments=None,
+        )
+    return ResultSegmentsOut(
+        shift_id=shift.id,
+        revision=rev.revision,
+        latest_revision=latest_revision,
+        available=True,
+        segments=[
+            ResultSegmentOut(
+                start=seg.start_ts,
+                end=seg.end_ts,
+                minutes=int((seg.end_ts - seg.start_ts).total_seconds()) // 60,
+                reason=seg.reason,
+                basis=seg.basis,
+            )
+            for seg in segments
+        ],
+    )
+
+
+# ---------------------------------------------------------------- 现场人工裁定
+
+
+def _adjudication_ack(
+    ruling, idempotent: bool, rev: ShiftResult | None, latest_revision: int
+) -> AdjudicationAck:
+    detail = None
+    if rev is not None:
+        detail = RevisionRef(
+            revision=rev.revision,
+            seq=rev.seq,
+            totals=ReasonMinutes(
+                maintenance=rev.maintenance_minutes,
+                failure=rev.failure_minutes,
+                pending=rev.pending_minutes,
+            ),
+            delta=ReasonMinutes(
+                maintenance=rev.d_maintenance,
+                failure=rev.d_failure,
+                pending=rev.d_pending,
+            ),
+            trigger=rev.trigger,
+        )
+    return AdjudicationAck(
+        ruling_no=ruling.ruling_no,
+        status=ruling.status,
+        idempotent=idempotent,
+        revision=rev.revision if rev is not None else None,
+        latest_revision=latest_revision,
+        revision_detail=detail,
+    )
+
+
+@app.post(
+    "/shifts/{shift_id}/adjudications",
+    response_model=AdjudicationAck,
+    tags=["adjudications"],
+)
+def submit_adjudication(
+    shift_id: int,
+    payload: AdjudicationIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """为已结算班次提交现场人工裁定。
+
+    - 裁定分钟覆盖自动事件归因；重叠分钟按生效顺序最新的未撤销裁定为准，
+      撤销后回退至此前有效裁定，无裁定时按当前最新事件版本计算；
+    - 同单号同内容重试幂等（200，不产生修订）；同单号异内容 409 RULING_CONFLICT；
+    - 仅当各原因分钟数变化时产生班次修订（revision 非空）并进入 /changes；
+    - 未知班次 404、班次未结算 409 SHIFT_NOT_SETTLED、区间越界 422 RULING_OUT_OF_RANGE、
+      非法原因/时间格式 422 VALIDATION_ERROR。
+    """
+    _shift, ruling, idempotent, rev, latest = services.submit_adjudication(
+        db, shift_id, payload
+    )
+    response.status_code = 200 if idempotent else 201
+    return _adjudication_ack(ruling, idempotent, rev, latest)
+
+
+@app.post(
+    "/shifts/{shift_id}/adjudications/{ruling_no}/revoke",
+    response_model=AdjudicationAck,
+    tags=["adjudications"],
+)
+def revoke_adjudication(
+    shift_id: int,
+    ruling_no: str,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """按单号撤销现场人工裁定。
+
+    - 首次撤销 201，分钟数变化时产生修订（trigger=adjudication_revoke）；
+    - 重复撤销幂等（200，不产生修订）；
+    - 未知班次 404 SHIFT_NOT_FOUND，未知单号 404 RULING_NOT_FOUND。
+    """
+    _shift, ruling, idempotent, rev, latest = services.revoke_adjudication(
+        db, shift_id, ruling_no
+    )
+    response.status_code = 200 if idempotent else 201
+    return _adjudication_ack(ruling, idempotent, rev, latest)
+
+
+@app.get(
+    "/shifts/{shift_id}/adjudications",
+    response_model=list[AdjudicationOut],
+    tags=["adjudications"],
+)
+def list_adjudications(shift_id: int, db: Session = Depends(get_db)):
+    """列出班次的全部现场人工裁定（含已撤销），按生效顺序排列。"""
+    _shift, rows = services.list_adjudications(db, shift_id)
+    return [
+        AdjudicationOut(
+            ruling_no=r.ruling_no,
+            start=r.start_ts,
+            end=r.end_ts,
+            reason=r.reason,
+            note=r.note,
+            status=r.status,
+            created_at=r.created_at,
+            revoked_at=r.revoked_at,
+        )
+        for r in rows
+    ]
+
+
+# ---------------------------------------------------------------- 变更同步
+
+
+def _change_entry(shift: Shift, rev: ShiftResult) -> ChangeEntry:
+    return ChangeEntry(
+        seq=rev.seq,
+        shift_id=shift.id,
+        device_id=shift.device_id,
+        shift_start=shift.start_ts,
+        shift_end=shift.end_ts,
+        revision=rev.revision,
+        totals=ReasonMinutes(
+            maintenance=rev.maintenance_minutes,
+            failure=rev.failure_minutes,
+            pending=rev.pending_minutes,
+        ),
+        delta=ReasonMinutes(
+            maintenance=rev.d_maintenance,
+            failure=rev.d_failure,
+            pending=rev.d_pending,
+        ),
+        event_versions=[EventVersionRef(**ev) for ev in rev.event_versions],
+        trigger=rev.trigger,
+        created_at=rev.created_at,
+    )
+
+
+@app.get("/changes", response_model=ChangePage, tags=["sync"])
+def list_changes(
+    cursor: int = Query(
+        default=0, ge=0, description="已消费的最大变更序号；0（缺省）表示从头回放"
+    ),
+    limit: int = Query(
+        default=100,
+        ge=1,
+        le=services.MAX_PAGE_SIZE,
+        description=f"每页条数，上限 {services.MAX_PAGE_SIZE}",
+    ),
+    db: Session = Depends(get_db),
+):
+    """下游报表同步：按全局递增游标分页读取每次结算/更正产生的变更。
+
+    - 每条含班次、修订号、各原因分钟数、差额与触发类型；
+    - 修订与变更记录同事务提交/回滚；序号顺序即提交顺序，
+      并发结算/更正时游标不会越过尚未可见的较早变更；
+    - 已返回条目不可变，重读内容不变；空页保持原游标；
+    - 非法游标（负数、超过当前最大序号）或超限页大小返回 422。
+    """
+    page, next_cursor = services.list_changes(db, cursor, limit)
+    return ChangePage(
+        changes=[_change_entry(shift, rev) for rev, shift in page],
+        next_cursor=next_cursor,
+    )
+
+
+# ---------------------------------------------------------------- 班次归因快照
+
+
+def _snapshot_entry(shift: Shift, rev: ShiftResult) -> ShiftSnapshotEntry:
+    return ShiftSnapshotEntry(
+        shift_id=shift.id,
+        start=shift.start_ts,
+        end=shift.end_ts,
+        revision=rev.revision,
+        totals=ReasonMinutes(
+            maintenance=rev.maintenance_minutes,
+            failure=rev.failure_minutes,
+            pending=rev.pending_minutes,
+        ),
+    )
+
+
+@app.get(
+    "/devices/{device_id}/shift-snapshots",
+    response_model=ShiftSnapshotPage,
+    tags=["sync"],
+)
+def get_shift_snapshot(
+    device_id: str,
+    start: datetime = Query(
+        description="半开时间窗口起点（含），必须带时区且精确到整分钟，如 2026-10-01T00:00:00+08:00"
+    ),
+    end: datetime = Query(
+        description="半开时间窗口终点（不含），必须带时区且精确到整分钟"
+    ),
+    limit: int = Query(
+        default=100,
+        ge=1,
+        le=services.MAX_SNAPSHOT_PAGE_SIZE,
+        description=f"每页条数，上限 {services.MAX_SNAPSHOT_PAGE_SIZE}",
+    ),
+    seq: int | None = Query(
+        default=None,
+        ge=0,
+        description="快照变更序号；缺省时以本次请求读取时已提交的最大序号为准",
+    ),
+    cursor: str | None = Query(
+        default=None, description="上一页返回的不透明续页游标；首页不传"
+    ),
+    db: Session = Depends(get_db),
+):
+    """下游报表首次接入 / 重建索引：按固定变更序号读取班次归因快照。
+
+    - 只列出与半开窗口 [start, end) 相交、截至快照序号**已结算**的班次；
+      每班次取 seq ≤ 快照序号的最后修订，返回班次标识、区间、修订号与三类原因分钟数；
+    - 未指定 seq 时以首次请求读取时已提交的最大变更序号为准；每页回传该序号，
+      可直接作为 GET /changes 的起始游标继续增量同步；
+    - 按班次标识（id）稳定升序翻页；快照只读不可变历史，后续更正、裁定或新结算
+      不改变同一快照的后续页；末页 next_cursor 为 null，空快照返回空页；
+    - 超过当前已提交范围的序号 → 422 INVALID_SNAPSHOT_SEQ；
+      与筛选条件或序号不匹配、伪造或损坏的续页游标 → 422 INVALID_CURSOR；
+      非法窗口（缺时区、未对齐整分钟、start ≥ end）或页大小 → 422 VALIDATION_ERROR；
+      未知设备 → 404 DEVICE_NOT_FOUND。
+    """
+    try:
+        _check_ts(start)
+        _check_ts(end)
+        if start >= end:
+            raise ValueError(
+                "invalid window: start must be earlier than end (half-open [start, end))"
+            )
+    except ValueError as exc:
+        raise services.ApiError(422, "VALIDATION_ERROR", str(exc))
+
+    page, snapshot_seq, next_cursor = services.get_shift_snapshot(
+        db, device_id, start, end, seq, limit, cursor
+    )
+    return ShiftSnapshotPage(
+        device_id=device_id,
+        start=start,
+        end=end,
+        snapshot_seq=snapshot_seq,
+        shifts=[_snapshot_entry(shift, rev) for shift, rev in page],
+        next_cursor=next_cursor,
+    )
+
+
+# ---------------------------------------------------------------- 现场停机对账（按设备）
+
+
+def _reconciliation_intervals(intervals: list) -> list[ReconciliationInterval]:
+    return [
+        ReconciliationInterval(
+            start=s,
+            end=e,
+            minutes=int((e - s).total_seconds()) // 60,
+        )
+        for s, e in intervals
+    ]
+
+
+@app.post(
+    "/devices/{device_id}/downtime-reconciliation",
+    response_model=ReconciliationOut,
+    tags=["reconciliation"],
+)
+def reconcile_downtime(device_id: str, payload: ReconciliationIn, db: Session = Depends(get_db)):
+    """按设备对账现场停机记录与系统已结算归因（固定变更序号，可重放）。
+
+    - 现场区间先裁剪到半开窗口 [start, end) 并合并重叠；系统侧按该序号选取
+      各相交班次的**最后修订**及其固化归因明细，三类归因段（保养/故障/待判）
+      的并集代表系统停机；
+    - 仅在该序号下已结算班次覆盖的分钟内比较：按时间顺序返回现场有而系统无
+      （field_only）、系统有而现场无（system_only）的最大连续区间及分钟总数；
+      不在已结算班次内的现场分钟另计 unreconciled（未对账，不算差异）；
+    - seq 缺省时固定为请求开始时已提交的最大变更序号，结果回传该序号以便重放；
+    - seq 超过当前最大序号 → 422 INVALID_SEQ；所选修订固化明细不可用
+      （结构引入前的历史修订）→ 422 SEGMENTS_UNAVAILABLE（不以当前结果替代）；
+      未知设备 → 404 DEVICE_NOT_FOUND；窗口/区间缺时区、未对齐整分钟或
+      start ≥ end → 422 VALIDATION_ERROR。
+    """
+    result = services.reconcile_device_downtime(
+        db,
+        device_id,
+        payload.start,
+        payload.end,
+        [(iv.start, iv.end) for iv in payload.field_intervals],
+        payload.seq,
+    )
+    return ReconciliationOut(
+        device_id=result["device_id"],
+        start=result["start"],
+        end=result["end"],
+        seq=result["seq"],
+        settled_minutes=result["settled_minutes"],
+        field_only=_reconciliation_intervals(result["field_only"]),
+        field_only_minutes=result["field_only_minutes"],
+        system_only=_reconciliation_intervals(result["system_only"]),
+        system_only_minutes=result["system_only_minutes"],
+        unreconciled=_reconciliation_intervals(result["unreconciled"]),
+        unreconciled_minutes=result["unreconciled_minutes"],
+        reconciled_shifts=[ReconciledShiftRef(**ref) for ref in result["reconciled_shifts"]],
+    )
+
+
+# ---------------------------------------------------------------- 停机损失费率发布
+
+
+def _rate_entry_out(e) -> RateEntryOut:
+    return RateEntryOut(
+        entry_no=e.entry_no,
+        start=e.start_ts,
+        end=e.end_ts,
+        reason=e.reason,
+        amount_per_minute=format_micro(e.amount_per_minute),
+    )
+
+
+def _rate_version_detail_out(rv, entries) -> RateVersionDetailOut:
+    return RateVersionDetailOut(
+        device_id=rv.device_id,
+        version=rv.version,
+        note=rv.note,
+        entry_count=len(entries),
+        created_at=rv.created_at,
+        entries=[_rate_entry_out(e) for e in entries],
+    )
+
+
+def _rate_version_published_out(
+    rv, entries, idempotent: bool
+) -> RateVersionPublishedOut:
+    detail = _rate_version_detail_out(rv, entries)
+    return RateVersionPublishedOut(
+        **detail.model_dump(), idempotent=idempotent
+    )
+
+
+@app.post(
+    "/devices/{device_id}/rate-versions",
+    response_model=RateVersionPublishedOut,
+    status_code=201,
+    tags=["loss-accounting"],
+)
+def publish_rate_version_route(
+    device_id: str,
+    payload: RateVersionIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """为设备发布完整费率版本，或幂等复用同内容的已发布版本。
+
+    - 每行含原因、带时区的整分钟半开生效区间 [start, end) 与非负每分钟金额
+      （十进制字符串，元，最多 6 位小数）；同版本**同原因**区间不得重叠
+      （端点相接允许），不同原因可重叠；费率表不能为空；
+    - 版本号设备内连续递增（服务端分配）：并发发布在设备行锁内串行，
+      版本连续无缺口；同费率表（时间等价、行顺序无关、金额数值相同）重试
+      复用原版本（200，idempotent=true），不同费率表才追加新版本（201）；
+    - 版本与其全部费率行**同事务原子提交**，不存在发布一半；
+    - 已发布版本不可变；之后的发布只产生新版本（历史核算账引用的内容永不变）；
+    - 未知设备 404 DEVICE_NOT_FOUND；金额/原因/区间非法、空表或同原因重叠
+      → 422 RATE_ENTRY_INVALID（整批拒绝，不留下任何版本或费率行）。
+    """
+    rv, entries, idempotent = services.publish_rate_version(db, device_id, payload)
+    response.status_code = 200 if idempotent else 201
+    return _rate_version_published_out(rv, entries, idempotent)
+
+
+@app.get(
+    "/devices/{device_id}/rate-versions",
+    response_model=list[RateVersionOut],
+    tags=["loss-accounting"],
+)
+def list_rate_versions_route(device_id: str, db: Session = Depends(get_db)):
+    """列出设备的全部费率版本（版本号降序，最新在前；仅摘要不含费率行）。"""
+    rows = services.list_rate_versions(db, device_id)
+    return [
+        RateVersionOut(
+            device_id=rv.device_id,
+            version=rv.version,
+            note=rv.note,
+            entry_count=count,
+            created_at=rv.created_at,
+        )
+        for rv, count in rows
+    ]
+
+
+@app.get(
+    "/devices/{device_id}/rate-versions/{version}",
+    response_model=RateVersionDetailOut,
+    tags=["loss-accounting"],
+)
+def get_rate_version_route(
+    device_id: str, version: int, db: Session = Depends(get_db)
+):
+    """读取设备某费率版本的完整费率表（按 entry_no 升序）。
+
+    未知设备 404 DEVICE_NOT_FOUND、未知版本 404 RATE_VERSION_NOT_FOUND。
+    """
+    rv, entries = services.get_rate_version(db, device_id, version)
+    return _rate_version_detail_out(rv, entries)
+
+
+# ---------------------------------------------------------------- 停机损失核算
+
+
+def _loss_accounting_out(accounting, pieces, idempotent: bool) -> LossAccountingOut:
+    by_reason = [
+        LossReasonTotal(
+            reason=reason,
+            priced_minutes=item["priced_minutes"],
+            unpriced_minutes=item["unpriced_minutes"],
+            amount=format_cents(item["amount_cents"]),
+            amount_cents=item["amount_cents"],
+        )
+        for reason, item in sorted(accounting.by_reason.items())
+    ]
+    totals = LossTotal(
+        amount=format_cents(accounting.total_cents),
+        amount_cents=accounting.total_cents,
+        priced_minutes=accounting.priced_minutes,
+        unpriced_minutes=accounting.unpriced_minutes,
+        by_reason=by_reason,
+    )
+    priced = [
+        PricedPieceOut(
+            piece_no=p.piece_no,
+            seg_no=p.seg_no,
+            start=p.start_ts,
+            end=p.end_ts,
+            minutes=p.minutes,
+            reason=p.reason,
+            rate_per_minute=format_micro(p.rate_per_minute),
+            amount=format_cents(p.amount_cents),
+            amount_cents=p.amount_cents,
+        )
+        for p in pieces
+        if p.priced
+    ]
+    unpriced = [
+        UnpricedPieceOut(
+            piece_no=p.piece_no,
+            seg_no=p.seg_no,
+            start=p.start_ts,
+            end=p.end_ts,
+            minutes=p.minutes,
+            reason=p.reason,
+        )
+        for p in pieces
+        if not p.priced
+    ]
+    return LossAccountingOut(
+        id=accounting.id,
+        shift_id=accounting.shift_id,
+        device_id=accounting.device_id,
+        revision=accounting.revision,
+        rate_version=accounting.rate_version,
+        idempotent=idempotent,
+        totals=totals,
+        priced_pieces=priced,
+        unpriced_pieces=unpriced,
+        created_at=accounting.created_at,
+    )
+
+
+@app.post(
+    "/shifts/{shift_id}/loss-accountings",
+    response_model=LossAccountingOut,
+    tags=["loss-accounting"],
+)
+def account_shift_loss_route(
+    shift_id: int,
+    payload: LossAccountingIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """对已结算班次按 (修订, 费率版本) 核算停机损失并幂等固化。
+
+    - 用该修订**同事务固化的归因段**（半开、整分钟、互不重叠）按所选费率
+      版本的费率边界切分：命中费率的子段以**定点数**（内部微元整数）逐段
+      计算 `每分钟金额 × 分钟数`，按分**四舍五入（0.5 分向上）**，再把各段
+      金额汇总；未匹配费率的分钟**单列待定价**（有分钟、无金额），绝不按
+      零金额计入合计；
+    - 结果（账头 + 全部切分明细）按（班次, 修订, 费率版本）**幂等固化**：
+      同组合重复核算返回既有账（200，idempotent=true），首次 201；
+      后续费率发布或归因更正只产生新组合的新账，**历史账不可改写**；
+    - 并发发布与核算：发布在设备行锁内整事务原子完成，核算锁定班次行与
+      该费率版本行，只能读到并锁定一个**已完整提交的版本**；
+    - 未知班次 404 SHIFT_NOT_FOUND、未结算 404 RESULT_NOT_FOUND、
+      未知修订 404 REVISION_NOT_FOUND、该设备未知费率版本
+      404 RATE_VERSION_NOT_FOUND；修订无固化明细（结构引入前的历史修订）
+      → 422 SEGMENTS_UNAVAILABLE，不以当前状态推算。
+    """
+    accounting, pieces, created = services.account_shift_loss(
+        db, shift_id, payload.rate_version, payload.revision
+    )
+    response.status_code = 201 if not created else 200
+    return _loss_accounting_out(accounting, pieces, idempotent=created)
+
+
+@app.get(
+    "/shifts/{shift_id}/loss-accountings",
+    response_model=list[LossAccountingOut],
+    tags=["loss-accounting"],
+)
+def list_loss_accountings_route(
+    shift_id: int,
+    revision: int | None = Query(default=None, ge=1, description="按修订号过滤"),
+    rate_version: int | None = Query(
+        default=None, ge=1, description="按费率版本过滤"
+    ),
+    db: Session = Depends(get_db),
+):
+    """列出班次已固化的停机损失账（历史账不可改写；可按修订/费率版本过滤）。
+
+    每条为一次固化的完整账（合计、按原因汇总、定价/待定价切分明细）；
+    未知班次 404 SHIFT_NOT_FOUND；过滤条件无匹配时返回空列表。
+    """
+    _shift, rows = services.list_loss_accountings(db, shift_id, revision, rate_version)
+    return [_loss_accounting_out(accounting, pieces, True) for accounting, pieces in rows]
+
+
+# ------------------------------------------------ 停机损失按生产批次分摊
+
+
+def _batch_windows_out(head) -> list[BatchWindowIn]:
+    return [
+        BatchWindowIn(
+            batch_no=b["batch_no"],
+            start=datetime.fromisoformat(b["start_ts"]),
+            end=datetime.fromisoformat(b["end_ts"]),
+        )
+        for b in sorted(head.batches, key=lambda b: b["batch_no"])
+    ]
+
+
+def _allocation_account_out(original, alloc_acc, splits, batch_nos: list[str]):
+    """组装单份损失账的分摊结果：各去向（全部批次 + 未分配）按原因汇总 + 来源明细。"""
+    by_reason_src = original.by_reason or {}
+
+    # 去向键：批次按批次号升序，未分配恒在最后
+    keys: list[tuple[str, str | None]] = [
+        ("batch", bno) for bno in batch_nos
+    ] + [("unallocated", None)]
+    agg: dict[tuple[str, str | None], dict] = {
+        key: {
+            reason: {"priced_minutes": 0, "unpriced_minutes": 0, "amount_cents": 0}
+            for reason in ("maintenance", "failure", "pending")
+        }
+        for key in keys
+    }
+    for sp in splits:
+        bucket = agg[(sp.dest, sp.batch_no)]
+        row = bucket[sp.reason]
+        if sp.priced:
+            row["priced_minutes"] += sp.minutes
+            row["amount_cents"] += sp.amount_cents or 0
+        else:
+            row["unpriced_minutes"] += sp.minutes
+
+    destinations: list[AllocationDestination] = []
+    for dest, batch_no in keys:
+        bucket = agg[(dest, batch_no)]
+        reason_totals = [
+            AllocationReasonTotal(
+                reason=reason,
+                priced_minutes=item["priced_minutes"],
+                unpriced_minutes=item["unpriced_minutes"],
+                amount=format_cents(item["amount_cents"]),
+                amount_cents=item["amount_cents"],
+            )
+            for reason, item in sorted(bucket.items())
+        ]
+        destinations.append(
+            AllocationDestination(
+                dest=dest,
+                batch_no=batch_no,
+                priced_minutes=sum(i["priced_minutes"] for i in bucket.values()),
+                unpriced_minutes=sum(
+                    i["unpriced_minutes"] for i in bucket.values()
+                ),
+                amount=format_cents(
+                    sum(i["amount_cents"] for i in bucket.values())
+                ),
+                amount_cents=sum(i["amount_cents"] for i in bucket.values()),
+                by_reason=reason_totals,
+            )
+        )
+
+    split_outs = [
+        AllocationSplitOut(
+            split_no=sp.split_no,
+            accounting_id=sp.accounting_id,
+            source_piece_no=sp.source_piece_no,
+            seg_no=sp.seg_no,
+            dest=sp.dest,
+            batch_no=sp.batch_no,
+            start=sp.start_ts,
+            end=sp.end_ts,
+            minutes=sp.minutes,
+            reason=sp.reason,
+            priced=sp.priced,
+            amount=format_cents(sp.amount_cents) if sp.priced else None,
+            amount_cents=sp.amount_cents,
+        )
+        for sp in splits
+    ]
+
+    totals = LossTotal(
+        amount=format_cents(original.total_cents),
+        amount_cents=original.total_cents,
+        priced_minutes=original.priced_minutes,
+        unpriced_minutes=original.unpriced_minutes,
+        by_reason=[
+            LossReasonTotal(
+                reason=reason,
+                priced_minutes=item.get("priced_minutes", 0),
+                unpriced_minutes=item.get("unpriced_minutes", 0),
+                amount=format_cents(item.get("amount_cents", 0)),
+                amount_cents=item.get("amount_cents", 0),
+            )
+            for reason, item in sorted(by_reason_src.items())
+        ],
+    )
+    return AllocationAccountResult(
+        accounting_id=alloc_acc.accounting_id,
+        shift_id=alloc_acc.shift_id,
+        revision=alloc_acc.revision,
+        rate_version=alloc_acc.rate_version,
+        totals=totals,
+        destinations=destinations,
+        splits=split_outs,
+    )
+
+
+def _loss_cost_allocation_out(head, rows, idempotent: bool) -> LossCostAllocationOut:
+    batch_nos = [b["batch_no"] for b in sorted(head.batches, key=lambda b: b["batch_no"])]
+    return LossCostAllocationOut(
+        id=head.id,
+        allocation_no=head.allocation_no,
+        device_id=head.device_id,
+        idempotent=idempotent,
+        batch_windows=_batch_windows_out(head),
+        accounts=[
+            _allocation_account_out(original, alloc_acc, splits, batch_nos)
+            for original, alloc_acc, splits in rows
+        ],
+        created_at=head.created_at,
+    )
+
+
+@app.post(
+    "/devices/{device_id}/loss-cost-allocations",
+    response_model=LossCostAllocationOut,
+    tags=["loss-allocation"],
+)
+def allocate_loss_costs_route(
+    device_id: str,
+    payload: LossCostAllocationIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """按生产批次追溯停机成本：把同一设备的已固化损失账按批次窗口分摊并固化。
+
+    - 提交分摊单号、已固化损失账 id 列表与一批"批次号 + 带时区整分钟半开
+      生产窗口"（一批次一窗口，窗口互不重叠、相接允许）；全部损失账须属于
+      路径设备，且每个班次至多引用一份账；
+    - 按账内**已固化**切分明细（定价明细金额已按分取整；待定价明细无金额）
+      与各窗口的半开交集分摊分钟，窗口外分钟归"未分配"；
+    - 定价明细整数分按交集分钟占该明细分钟的比例分配：先取整，余分按小数
+      余数降序补足，同余数批次号升序、未分配最后；各去向金额之和恒等于
+      原明细金额；待定价只分分钟、不产生金额；
+    - 结果固化各账、各去向按原因汇总的分钟/金额及来源明细，历史分摊不随后续
+      归因修订或费率发布改变；同单号同内容重试返回原结果（200，idempotent=true），
+      同单号异内容 409 ALLOCATION_CONFLICT（列表顺序无关同内容判定）；
+    - 未知设备 404 DEVICE_NOT_FOUND；未知/跨设备账 404 LOSS_ACCOUNTING_NOT_FOUND；
+      同班次多账 422 ACCOUNTINGS_SAME_SHIFT；批次号重复/窗口重叠/非法窗口
+      422（BATCH_WINDOW_INVALID / VALIDATION_ERROR）；任一非法整单拒绝不留痕。
+    """
+    if payload.device_id != device_id:
+        raise services.ApiError(
+            422,
+            "VALIDATION_ERROR",
+            f"device_id in body {payload.device_id!r} does not match path {device_id!r}",
+        )
+    head, rows, idempotent = services.allocate_loss_costs(db, payload)
+    response.status_code = 200 if idempotent else 201
+    return _loss_cost_allocation_out(head, rows, idempotent)
+
+
+@app.get(
+    "/loss-cost-allocations/{allocation_no}",
+    response_model=LossCostAllocationOut,
+    tags=["loss-allocation"],
+)
+def get_loss_cost_allocation_route(allocation_no: str, db: Session = Depends(get_db)):
+    """按单号读取固化的按批次停机损失分摊（历史分摊不可改写）。
+
+    未知单号 404 ALLOCATION_NOT_FOUND。
+    """
+    head, rows = services.get_loss_cost_allocation(db, allocation_no)
+    return _loss_cost_allocation_out(head, rows, True)
+
+
+@app.get(
+    "/devices/{device_id}/loss-cost-allocations",
+    response_model=list[LossCostAllocationOut],
+    tags=["loss-allocation"],
+)
+def list_device_loss_cost_allocations_route(
+    device_id: str, db: Session = Depends(get_db)
+):
+    """列出设备的全部固化分摊单（按提交先后；未知设备 404 DEVICE_NOT_FOUND）。"""
+    data = services.list_device_loss_cost_allocations(db, device_id)
+    return [_loss_cost_allocation_out(head, rows, True) for head, rows in data]
+
+
+# ------------------------------------------------ 按设备期间停机损失结账
+
+
+def _closing_item_out(item, shift, accounting, pieces) -> ClosingItemOut:
+    by_reason = [
+        LossReasonTotal(
+            reason=reason,
+            priced_minutes=row["priced_minutes"],
+            unpriced_minutes=row["unpriced_minutes"],
+            amount=format_cents(row["amount_cents"]),
+            amount_cents=row["amount_cents"],
+        )
+        for reason, row in sorted(item.by_reason.items())
+    ]
+    totals = LossTotal(
+        amount=format_cents(item.total_cents),
+        amount_cents=item.total_cents,
+        priced_minutes=item.priced_minutes,
+        unpriced_minutes=item.unpriced_minutes,
+        by_reason=by_reason,
+    )
+    priced = [
+        PricedPieceOut(
+            piece_no=p.piece_no,
+            seg_no=p.seg_no,
+            start=p.start_ts,
+            end=p.end_ts,
+            minutes=p.minutes,
+            reason=p.reason,
+            rate_per_minute=format_micro(p.rate_per_minute),
+            amount=format_cents(p.amount_cents),
+            amount_cents=p.amount_cents,
+        )
+        for p in pieces
+        if p.priced
+    ]
+    unpriced = [
+        UnpricedPieceOut(
+            piece_no=p.piece_no,
+            seg_no=p.seg_no,
+            start=p.start_ts,
+            end=p.end_ts,
+            minutes=p.minutes,
+            reason=p.reason,
+        )
+        for p in pieces
+        if not p.priced
+    ]
+    return ClosingItemOut(
+        item_no=item.item_no,
+        shift_id=item.shift_id,
+        shift_start=shift.start_ts,
+        shift_end=shift.end_ts,
+        revision=item.revision,
+        revision_seq=item.revision_seq,
+        accounting_id=item.accounting_id,
+        rate_version=accounting.rate_version,
+        totals=totals,
+        priced_pieces=priced,
+        unpriced_pieces=unpriced,
+    )
+
+
+def _loss_period_closing_out(head, items, idempotent: bool) -> LossPeriodClosingOut:
+    by_reason = [
+        ClosingReasonTotal(
+            reason=reason,
+            priced_minutes=row["priced_minutes"],
+            unpriced_minutes=row["unpriced_minutes"],
+            amount=format_cents(row["amount_cents"]),
+            amount_cents=row["amount_cents"],
+        )
+        for reason, row in sorted(head.by_reason.items())
+    ]
+    totals = ClosingTotals(
+        amount=format_cents(head.total_cents),
+        amount_cents=head.total_cents,
+        priced_minutes=head.priced_minutes,
+        unpriced_minutes=head.unpriced_minutes,
+        by_reason=by_reason,
+    )
+    return LossPeriodClosingOut(
+        id=head.id,
+        closing_no=head.closing_no,
+        device_id=head.device_id,
+        idempotent=idempotent,
+        start=head.start_ts,
+        end=head.end_ts,
+        seq=head.seq,
+        rate_version=head.rate_version,
+        totals=totals,
+        items=[
+            _closing_item_out(item, shift, accounting, pieces)
+            for item, shift, accounting, pieces in items
+        ],
+        created_at=head.created_at,
+    )
+
+
+@app.post(
+    "/devices/{device_id}/loss-closings",
+    response_model=LossPeriodClosingOut,
+    tags=["loss-closing"],
+)
+def close_device_loss_period_route(
+    device_id: str,
+    payload: LossPeriodClosingIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """财务按设备封存一个期间的停机损失结账（整单同事务，全或无）。
+
+    - 只纳入**期间内起始**（班次 start ∈ [start, end)）且截至 seq 已有结算
+      修订的班次，按整班次取序号 ≤ seq 的最后修订，用该修订**固化的归因段**
+      与指定的**已发布**费率版本，沿用现有逐段计价与待定价规则形成或复用
+      (班次, 修订, 费率版本) 的损失账（已有同组合账则复用，绝不重算改写）；
+    - 整单在**同一事务**固化：各班次所选修订（含修订序号）、账引用及按原因
+      汇总的金额、定价与待定价分钟；任一修订缺少固化明细（结构引入前的历史
+      修订）→ 422 SEGMENTS_UNAVAILABLE 整单失败，不留部分新账或结账记录；
+    - 无符合班次时固化一张**空结账**（items 为空、合计全 0）；
+    - 同单号同输入重试返回原结账（200，idempotent=true），首次 201；
+      同单号异输入（设备/期间/序号/费率版本不同）→ 409 CLOSING_CONFLICT；
+    - 序号越界 422 INVALID_SEQ、未知设备 404 DEVICE_NOT_FOUND、该设备未知
+      费率版本 404 RATE_VERSION_NOT_FOUND、非法期间 422 VALIDATION_ERROR；
+    - 结账固化后，后续事件更正、费率发布与重新核算只产生新修订/新账，
+      **历史结账及其引用永不改变**。
+    """
+    if payload.device_id != device_id:
+        raise services.ApiError(
+            422,
+            "VALIDATION_ERROR",
+            f"device_id in body {payload.device_id!r} does not match path {device_id!r}",
+        )
+    head, items, idempotent = services.close_device_loss_period(db, payload)
+    response.status_code = 200 if idempotent else 201
+    return _loss_period_closing_out(head, items, idempotent)
+
+
+@app.get(
+    "/loss-closings/{closing_no}",
+    response_model=LossPeriodClosingOut,
+    tags=["loss-closing"],
+)
+def get_loss_period_closing_route(closing_no: str, db: Session = Depends(get_db)):
+    """按单号读取固化的期间停机损失结账及明细（历史结账不可改写）。
+
+    未知单号 404 CLOSING_NOT_FOUND。
+    """
+    head, items = services.get_loss_period_closing(db, closing_no)
+    return _loss_period_closing_out(head, items, True)
+
+
+@app.get(
+    "/devices/{device_id}/loss-closings",
+    response_model=list[LossPeriodClosingOut],
+    tags=["loss-closing"],
+)
+def list_device_loss_period_closings_route(
+    device_id: str, db: Session = Depends(get_db)
+):
+    """列出设备的全部固化期间停机损失结账（按提交先后；未知设备 404）。"""
+    data = services.list_device_loss_period_closings(db, device_id)
+    return [_loss_period_closing_out(head, items, True) for head, items in data]
+
+
+# ------------------------------------------------ 计划保养核对
+
+
+def _maintenance_plan_out(plan, idempotent: bool) -> MaintenancePlanOut:
+    windows = sorted(
+        (
+            (
+                datetime.fromisoformat(w["start_ts"]),
+                datetime.fromisoformat(w["end_ts"]),
+            )
+            for w in plan.windows
+        ),
+        key=lambda w: w[0],
+    )
+    return MaintenancePlanOut(
+        id=plan.id,
+        plan_no=plan.plan_no,
+        device_id=plan.device_id,
+        idempotent=idempotent,
+        start=plan.start_ts,
+        end=plan.end_ts,
+        windows=[
+            MaintenanceWindowOut(
+                start=s,
+                end=e,
+                minutes=int((e - s).total_seconds()) // 60,
+            )
+            for s, e in windows
+        ],
+        created_at=plan.created_at,
+    )
+
+
+def _maintenance_intervals(intervals: list) -> list[MaintenanceInterval]:
+    return [
+        MaintenanceInterval(
+            start=s,
+            end=e,
+            minutes=int((e - s).total_seconds()) // 60,
+        )
+        for s, e in intervals
+    ]
+
+
+@app.post(
+    "/devices/{device_id}/maintenance-plans",
+    response_model=MaintenancePlanOut,
+    tags=["maintenance-plans"],
+)
+def submit_maintenance_plan_route(
+    device_id: str,
+    payload: MaintenancePlanIn,
+    response: Response,
+    db: Session = Depends(get_db),
+):
+    """车间按设备提交计划保养单（提交后不可改）。
+
+    - 输入全局唯一单号、带时区整分钟的半开期间与非空保养窗口；窗口须完整
+      落在期间内且互不重叠（半开，端点相接允许）；同设备各计划单的期间
+      不得重叠（端点相接允许）；
+    - 提交后不可改：同单号同内容重试返回原单（200，idempotent=true，
+      窗口换序、等价时区仍算同内容），首次 201；同单号异内容
+      409 MAINTENANCE_PLAN_CONFLICT；与既有计划期间重叠
+      409 MAINTENANCE_PLAN_OVERLAP；
+    - 未知设备 404 DEVICE_NOT_FOUND；空窗口/窗口越出期间/窗口重叠、
+      期间缺时区/未对齐整分钟/start≥end → 422（MAINTENANCE_WINDOW_INVALID /
+      VALIDATION_ERROR），任一非法整单拒绝不留痕。
+    """
+    if payload.device_id != device_id:
+        raise services.ApiError(
+            422,
+            "VALIDATION_ERROR",
+            f"device_id in body {payload.device_id!r} does not match path {device_id!r}",
+        )
+    plan, idempotent = services.submit_maintenance_plan(db, payload)
+    response.status_code = 200 if idempotent else 201
+    return _maintenance_plan_out(plan, idempotent)
+
+
+@app.get(
+    "/maintenance-plans/{plan_no}",
+    response_model=MaintenancePlanOut,
+    tags=["maintenance-plans"],
+)
+def get_maintenance_plan_route(plan_no: str, db: Session = Depends(get_db)):
+    """按单号读取固化的计划保养单（提交后不可改）。
+
+    未知单号 404 MAINTENANCE_PLAN_NOT_FOUND。
+    """
+    plan = services.get_maintenance_plan(db, plan_no)
+    return _maintenance_plan_out(plan, True)
+
+
+@app.get(
+    "/devices/{device_id}/maintenance-plans",
+    response_model=list[MaintenancePlanOut],
+    tags=["maintenance-plans"],
+)
+def list_device_maintenance_plans_route(
+    device_id: str, db: Session = Depends(get_db)
+):
+    """列出设备的全部计划保养单（按提交先后；未知设备 404 DEVICE_NOT_FOUND）。"""
+    data = services.list_device_maintenance_plans(db, device_id)
+    return [_maintenance_plan_out(p, True) for p in data]
+
+
+@app.get(
+    "/maintenance-plans/{plan_no}/check",
+    response_model=MaintenanceCheckOut,
+    tags=["maintenance-plans"],
+)
+def check_maintenance_plan_route(
+    plan_no: str,
+    seq: int | None = Query(
+        default=None,
+        ge=0,
+        description="固定变更序号；缺省时以本次查询开始时已提交的最大序号为准",
+    ),
+    db: Session = Depends(get_db),
+):
+    """按单号核对计划保养是否执行（固定变更序号，只认已结算班次的固化归因段）。
+
+    - 仅取序号 ≤ 所用序号的已结算班次最后修订：计划保养窗口与该修订
+      **"保养"归因段**的交集计为**已执行**；窗口内已结算但非保养的分钟
+      （故障/待判/无停机归因）计为**未执行**；期间内窗口外的保养段计为
+      **计划外**；计划窗口中未被任何已结算班次覆盖的分钟单列**未核实**，
+      不计未执行；
+    - seq 缺省时固定为查询开始时已提交的最大变更序号，结果回传 seq 与
+      basis（所用各班次修订及序号）以便重放；历史固化不随后续更正改变；
+    - seq 越过最新变更序号 → 422 INVALID_SEQ；所需历史修订缺固化段
+      → 422 SEGMENTS_UNAVAILABLE，整次查询报不可用，不以现态推算；
+      未知单号 → 404 MAINTENANCE_PLAN_NOT_FOUND。
+    """
+    plan, result = services.check_maintenance_plan(db, plan_no, seq)
+    return MaintenanceCheckOut(
+        plan_no=plan.plan_no,
+        device_id=plan.device_id,
+        start=plan.start_ts,
+        end=plan.end_ts,
+        seq=result["seq"],
+        executed=_maintenance_intervals(result["executed"]),
+        executed_minutes=result["executed_minutes"],
+        not_executed=_maintenance_intervals(result["not_executed"]),
+        not_executed_minutes=result["not_executed_minutes"],
+        unplanned=_maintenance_intervals(result["unplanned"]),
+        unplanned_minutes=result["unplanned_minutes"],
+        unverified=_maintenance_intervals(result["unverified"]),
+        unverified_minutes=result["unverified_minutes"],
+        window_minutes=result["window_minutes"],
+        covered_minutes=result["covered_minutes"],
+        basis=[MaintenanceShiftBasis(**ref) for ref in result["basis"]],
+    )
