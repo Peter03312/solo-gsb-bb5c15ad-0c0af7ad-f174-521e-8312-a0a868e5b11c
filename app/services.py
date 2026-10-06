@@ -1839,7 +1839,19 @@ def _get_or_create_accounting(
         )
         for s in seg_rows
     ]
-    result = pricing.price_segments(frozen, lines)
+    # 定点逐段计价、按分四舍五入后汇总；落库前 pricing 已对每段金额、按原因
+    # 汇总与账头合计做 BIGINT 上界校验——越界（如超长班次）在写入任何行之前
+    # 转 422 AMOUNT_OVERFLOW，由调用方事务回滚，绝不截断/饱和或留半截账。
+    try:
+        result = pricing.price_segments(frozen, lines)
+    except pricing.AmountOverflowError as exc:
+        raise ApiError(
+            422,
+            "AMOUNT_OVERFLOW",
+            f"loss accounting for shift id={shift_id} revision {rev.revision} "
+            f"rate version {rate_version_no} overflows the database amount "
+            f"column; the whole operation is rolled back without truncation: {exc}",
+        )
 
     accounting = LossAccounting(
         shift_id=shift_id,
@@ -2508,14 +2520,28 @@ def close_device_loss_period(
             accounting, pieces, _idempotent = _get_or_create_accounting(
                 db, locked, rev, payload.rate_version
             )
-            account_summaries.append(
-                closing.AccountSummary(
-                    total_cents=accounting.total_cents,
-                    priced_minutes=accounting.priced_minutes,
-                    unpriced_minutes=accounting.unpriced_minutes,
-                    by_reason=accounting.by_reason,
-                )
+            summary = closing.AccountSummary(
+                total_cents=accounting.total_cents,
+                priced_minutes=accounting.priced_minutes,
+                unpriced_minutes=accounting.unpriced_minutes,
+                by_reason=accounting.by_reason,
             )
+            # 防御性复验：既有账固化时已过同界校验；此处也覆盖历史/直写库数据。
+            try:
+                closing.ensure_account_summary_fits(
+                    summary, where=f"shift id={shift.id} item {item_no}"
+                )
+            except pricing.AmountOverflowError as exc:
+                raise ApiError(
+                    422,
+                    "AMOUNT_OVERFLOW",
+                    f"period closing {payload.closing_no!r} references a loss "
+                    f"accounting (shift id={shift.id}, revision {rev.revision}, "
+                    f"rate version {payload.rate_version}) whose amount overflows "
+                    f"the database amount column; the whole closing is rolled back "
+                    f"without truncation: {exc}",
+                )
+            account_summaries.append(summary)
             item = LossPeriodClosingItem(
                 closing_id=head.id,
                 item_no=item_no,
@@ -2532,6 +2558,19 @@ def close_device_loss_period(
             item_rows.append((item, locked, accounting, pieces))
 
         totals = closing.summarize(account_summaries)
+        # 多班次金额机械求和可能越过 BIGINT（每份账自身在界内亦然）：
+        # 写结账头前拒绝（头此前以 0 flush，尚未写任何条目金额），
+        # 下方 except ApiError 整体回滚，不留新账/条目/结账。
+        try:
+            closing.ensure_totals_fit(totals)
+        except pricing.AmountOverflowError as exc:
+            raise ApiError(
+                422,
+                "AMOUNT_OVERFLOW",
+                f"period closing {payload.closing_no!r} total overflows the "
+                "database amount column; the whole closing is rolled back "
+                f"without truncation: {exc}",
+            )
         head.total_cents = totals.total_cents
         head.priced_minutes = totals.priced_minutes
         head.unpriced_minutes = totals.unpriced_minutes

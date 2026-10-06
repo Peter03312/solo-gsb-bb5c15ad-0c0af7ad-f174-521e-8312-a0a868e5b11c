@@ -11,9 +11,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.pricing import (  # noqa: E402
     AmountError,
+    AmountOverflowError,
+    DB_AMOUNT_MAX,
     FrozenSegment,
     RateLine,
     RateTableError,
+    ensure_cents_fit,
     format_cents,
     format_micro,
     parse_amount,
@@ -356,6 +359,95 @@ def test_pricing_rates_outside_segment_fully_unpriced():
     assert result.total_cents == 0
     assert result.unpriced_minutes == 60
     assert len(result.unpriced) == 1
+
+
+# ---------------------------------------------------------------- BIGINT 金额上界
+
+
+def test_ensure_cents_fit_boundary_inclusive():
+    ensure_cents_fit(0)  # 0 合法
+    ensure_cents_fit(DB_AMOUNT_MAX)  # 恰好等于上界：精确保存，不拒绝
+    for bad in (DB_AMOUNT_MAX + 1, DB_AMOUNT_MAX * 10):
+        try:
+            ensure_cents_fit(bad)
+        except AmountOverflowError:
+            pass
+        else:
+            raise AssertionError(f"expected AmountOverflowError for {bad}")
+
+
+def test_max_legal_rate_prices_in_bounds():
+    # 每分钟 999,999,999,999 元（12 位整数上限）是合法费率；1 分钟
+    # → 999,999,999,999.999999 元按分四舍五入 = 99,999,999,999,900 分，
+    # 远在 BIGINT 界内：合法费率不得仅因数值巨大而被拒绝。
+    rate = parse_amount("999999999999")
+    validate_rate_lines(
+        [RateLine(reason="failure", start=t(0), end=t(24), amount_per_minute=rate)]
+    )
+    result = price_segments(
+        [seg(1, t(10), t(10, 1), "failure")],
+        [RateLine(reason="failure", start=t(0), end=t(24), amount_per_minute=rate)],
+    )
+    assert result.priced[0].amount_cents == 99_999_999_999_900
+    assert result.total_cents == 99_999_999_999_900
+
+
+def test_pricing_piece_amount_overflow_rejected_without_saturation():
+    # 每分钟 999,999,999,999 元 × 100,000 分钟（约 69 天的长班次逐段）
+    # ≈ 9.9999×10^18 分 > 2^63-1 ≈ 9.22×10^18 分：逐段取整后即越界。
+    rate = parse_amount("999999999999")
+    start = t(0)
+    end = start + timedelta(minutes=100_000)
+    try:
+        price_segments(
+            [FrozenSegment(seg_no=1, start=start, end=end, reason="failure")],
+            [RateLine(reason="failure", start=start, end=end, amount_per_minute=rate)],
+        )
+    except AmountOverflowError as exc:
+        # 不截断、不饱和：错误描述的是越界本身，真实金额大于 BIGINT 上界
+        assert "exceeds the database BIGINT" in str(exc)
+        assert 9_999_999_999_990_000_000 > DB_AMOUNT_MAX
+    else:
+        raise AssertionError("expected AmountOverflowError on oversized piece")
+
+
+def test_pricing_total_overflow_across_pieces_rejected():
+    # 单段均在界内、逐段取整后之和越界：两条相邻费率边界各覆盖 100,000 分钟，
+    # 每段 5×10^18 分（界内），同一固化段被切成两段、合计 10^19 分越界。
+    rate = parse_amount("500000000000")  # 5×10^11 元/分
+    p1s, p1e = t(0), t(0) + timedelta(minutes=100_000)
+    p2s, p2e = p1e, p1e + timedelta(minutes=100_000)
+    rows = [
+        RateLine(reason="failure", start=p1s, end=p1e, amount_per_minute=rate),
+        RateLine(reason="failure", start=p2s, end=p2e, amount_per_minute=rate),
+    ]
+    one_piece = price_segments(
+        [FrozenSegment(seg_no=1, start=p1s, end=p1e, reason="failure")],
+        rows,
+    )
+    assert one_piece.priced[0].amount_cents == 5 * 10**18
+    try:
+        price_segments(
+            [FrozenSegment(seg_no=1, start=p1s, end=p2e, reason="failure")],
+            rows,
+        )
+    except AmountOverflowError:
+        pass
+    else:
+        raise AssertionError("expected AmountOverflowError when total exceeds BIGINT")
+
+
+def test_pricing_unpriced_long_minutes_have_no_amount_and_never_overflow():
+    # 待定价分钟不产生金额：百万分钟无费率也不越界、不作零金额。
+    start = t(0)
+    end = start + timedelta(minutes=1_000_000)
+    result = price_segments(
+        [FrozenSegment(seg_no=1, start=start, end=end, reason="failure")],
+        [line("failure", end, end + timedelta(minutes=1), "1")],  # 完全不覆盖
+    )
+    assert result.priced == []
+    assert result.total_cents == 0
+    assert result.unpriced_minutes == 1_000_000
 
 
 if __name__ == "__main__":

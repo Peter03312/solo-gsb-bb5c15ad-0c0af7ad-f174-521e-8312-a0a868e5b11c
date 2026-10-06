@@ -12,7 +12,11 @@
   （1 元 = 10^6 微元），即 BIGINT 可承载的定点数；
 - 每个切分后的定价段：段金额(微元) = 每分钟金额(微元) × 段内分钟数；
   段金额按「分」四舍五入（0.5 分向上，ROUND_HALF_UP），得「分」整数；
-- 合计 = 各段「分」整数之和（先逐段取整、再汇总，绝不先汇总后取整）。
+- 合计 = 各段「分」整数之和（先逐段取整、再汇总，绝不先汇总后取整）；
+- 落库前做 BIGINT 上界校验：单账任一定价明细金额、按原因汇总金额或账头
+  合计一旦超过数据库 BIGINT 金额列范围，抛 AmountOverflowError——绝不
+  截断或饱和为上界，由调用方回滚整笔操作并返回 422 AMOUNT_OVERFLOW。
+  费率本身合法（≤ 10^12 元/分钟）不会仅因"未来长班次可能越界"而被拒绝。
 
 核算规则
 - 输入为某修订**固化**的归因段（与 attribution.attribute_segments 同形态：
@@ -43,9 +47,19 @@ _AMOUNT_RE = re.compile(r"^\d+(?:\.\d+)?$")
 #: 的中间积相容，超出视为非法输入而不是让数据库溢出。
 MAX_AMOUNT_INTEGER_DIGITS = 12
 
+#: 金额列在数据库中为 PostgreSQL BIGINT（int8）：[-2^63, 2^63-1]。
+#: 金额恒非负，落库上界即 2^63-1；分段金额（分）、账头/结账合计及按原因
+#: 汇总（分）写入前都必须不大于该值，否则在写入前以 AmountOverflowError
+#: 拒绝，绝不依赖数据库溢出报错，更不截断或饱和。
+DB_AMOUNT_MAX = 2**63 - 1
+
 
 class AmountError(ValueError):
     """金额字符串非法（空、非数字、负号/指数、多于 6 位小数等）。"""
+
+
+class AmountOverflowError(ArithmeticError):
+    """定点金额超过数据库 BIGINT 金额列范围（不截断、不饱和）。"""
 
 
 class RateTableError(ValueError):
@@ -103,6 +117,21 @@ def round_micro_to_cents_half_up(value_micro: int) -> int:
 def format_cents(cents: int) -> str:
     """分整数 → 两位小数十进制字符串（如 15000 -> "150.00"）。"""
     return f"{cents // 100}.{cents % 100:02d}"
+
+
+def ensure_cents_fit(cents: int, what: str = "amount") -> None:
+    """校验整数分金额可写入 BIGINT 金额列；越界抛 AmountOverflowError。
+
+    金额恒非负，只检查上界（2^63-1）。不截断、不饱和：由调用方整体回滚。
+    what 用于给出语义化定位（如 "priced piece 3"、"loss accounting total"）。
+    """
+    if cents > DB_AMOUNT_MAX:
+        raise AmountOverflowError(
+            f"{what} {cents} cents exceeds the database BIGINT amount column "
+            f"limit {DB_AMOUNT_MAX} cents (about {DB_AMOUNT_MAX // 100:_} yuan); "
+            "the operation must be rejected with AMOUNT_OVERFLOW instead of "
+            "truncating or saturating the amount"
+        )
 
 
 def _check_minute_interval(start: datetime, end: datetime) -> None:
@@ -289,6 +318,13 @@ def price_segments(
             amount_cents = round_micro_to_cents_half_up(
                 line.amount_per_minute * minutes
             )
+            # 逐段取整后立即校验：任一定价明细越界即拒绝（不截断、不饱和）。
+            # 段金额可能已超过 BIGINT，即使多段正负相消也无意义（金额恒非负）。
+            ensure_cents_fit(
+                amount_cents,
+                f"priced piece {piece_no} ({seg.reason}, {minutes} minute(s) at "
+                f"{line.amount_per_minute} micro-units per minute) amount",
+            )
             priced.append(
                 PricedPiece(
                     piece_no=piece_no,
@@ -317,6 +353,13 @@ def price_segments(
     # 相邻（端点相接）且同原因的待定价间隙合并为最大连续区间；
     # 不同原因或中间隔着未停机分钟（不会相接）则不合并。
     unpriced = _merge_unpriced(raw_unpriced)
+
+    # 落库前账头合计与按原因汇总金额的 BIGINT 上界校验：长班次多段逐段
+    # 取整后的汇总可能超过 BIGINT（单段均在界内时亦然）。不截断、不饱和，
+    # 由调用方整笔回滚并返回 422 AMOUNT_OVERFLOW。
+    ensure_cents_fit(total_cents, "loss accounting total amount")
+    for reason, rt in totals.items():
+        ensure_cents_fit(rt.amount_cents, f"loss accounting by_reason {reason!r} amount")
 
     return PricingResult(
         priced=priced,

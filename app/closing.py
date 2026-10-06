@@ -8,7 +8,11 @@
 - 定价分钟、待定价分钟分别相加；三类原因（保养/故障/待判）恒列出，
   无任何账时为全 0 的空汇总（空结账）；
 - 结账不重新计价，只汇总既有账：形成或复用损失账的逐段计价与待定价规则
-  完全沿用 pricing.price_segments。
+  完全沿用 pricing.price_segments；
+- 多班次金额机械求和可能超过数据库 BIGINT 金额列范围：ensure_totals_fit
+  在写入前对整单合计及各原因汇总做上界校验，越界抛 pricing.AmountOverflowError
+  （不截断、不饱和），由调用方整单回滚返回 422 AMOUNT_OVERFLOW。每份纳入账
+  自身已在核算固化时通过同样的 BIGINT 上界校验。
 
 本模块只依赖标准库，可脱离 Web/数据库独立测试。
 """
@@ -18,6 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .attribution import REASONS
+from .pricing import ensure_cents_fit
 
 
 @dataclass(frozen=True)
@@ -112,3 +117,31 @@ def summarize(accounts: list[AccountSummary]) -> ClosingTotals:
         unpriced_minutes=total_unpriced,
         by_reason=totals,
     )
+
+
+def ensure_account_summary_fits(acc: AccountSummary, *, where: str = "") -> None:
+    """校验单份纳入账的账头合计与按原因汇总金额可写入 BIGINT 金额列。
+
+    正常路径上每份账固化时已通过 pricing 的同界校验；此处为结账写路径的
+    防御性复验（含历史/直写库数据），越界抛 pricing.AmountOverflowError。
+    """
+
+    suffix = f" for {where}" if where else ""
+    ensure_cents_fit(acc.total_cents, f"loss accounting total{suffix}")
+    for reason in REASONS:
+        cents = int((acc.by_reason.get(reason) or {}).get("amount_cents", 0))
+        ensure_cents_fit(cents, f"loss accounting by_reason {reason!r} amount{suffix}")
+
+
+def ensure_totals_fit(totals: ClosingTotals) -> None:
+    """校验结账整单合计与各原因汇总金额可写入 BIGINT 金额列。
+
+    多班次机械求和即使每份账在界内也可能越界；在写入结账头/条目前调用，
+    越界抛 pricing.AmountOverflowError（不截断、不饱和），调用方整单回滚。
+    """
+
+    ensure_cents_fit(totals.total_cents, "period closing total amount")
+    for reason, rt in totals.by_reason.items():
+        ensure_cents_fit(
+            rt.amount_cents, f"period closing by_reason {reason!r} amount"
+        )

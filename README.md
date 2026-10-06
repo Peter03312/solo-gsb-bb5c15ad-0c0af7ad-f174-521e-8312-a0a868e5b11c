@@ -204,6 +204,21 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
     未知修订 `404 REVISION_NOT_FOUND`、该设备未知费率版本 `404 RATE_VERSION_NOT_FOUND`；
     修订未固化明细（结构引入前的历史修订）→ `422 SEGMENTS_UNAVAILABLE`，
     不以当前状态推算；金额/区间/重叠/空表非法 → `422 RATE_ENTRY_INVALID`。
+- **金额 BIGINT 上界（不截断、不饱和）**：数据库金额列为 BIGINT（上界
+  `2^63-1` 分）。费率每分钟金额最多 12 位整数、6 位小数的既有规则不变，
+  **合法费率不会仅因未来长班次可能越界而被拒绝**；越界只在实际核算/结账时
+  判定——
+  - 核算（`loss-accountings`）：仍按固化归因段与费率边界逐段以定点数
+    四舍五入到分；**任一定价明细金额、按原因汇总或账头合计超过 BIGINT**
+    （如约 69 天以上的班次配最高合法每分钟金额）→ `422 AMOUNT_OVERFLOW`，
+    整笔事务回滚，**不留账头或任何切分明细**；待定价分钟不产生金额，永不越界；
+  - 期间结账（`loss-closings`）：每份纳入账自身须在界内，多班次机械求和的
+    **条目引用金额、按原因汇总或账头合计越界**（即使每份账单独都在界内）
+    → `422 AMOUNT_OVERFLOW`，整单回滚，结账头、条目及事务内新建的损失账
+    **全部不留痕**；此前已固化的历史账/结账原样保留、不改写；
+  - 边界内（含恰好 `2^63-1`）金额**精确保存**，不截断、不饱和；同组合核算与
+    同单号结账的重试语义不变：失败重试仍返回 `422 AMOUNT_OVERFLOW`，成功
+    幂等重试仍返回原结果。
 - **按批次分摊停机成本**（`POST /devices/{device_id}/loss-cost-allocations`）：
   一次提交面向**同一设备**：分摊单号 `allocation_no`、已固化损失账 id 列表与
   一批批次窗口（`batch_no` + 带时区整分钟半开 `[start, end)`，一批次一窗口）。
@@ -298,6 +313,7 @@ docker compose exec app pytest            # 算法单测 + API 端到端测试
 | 422 | `SEGMENTS_UNAVAILABLE` | 对账/损失核算所选修订未固化归因明细（结构引入前的历史修订，当时裁定状态无法可靠还原），拒绝以当前状态推算 |
 | 404 | `RATE_VERSION_NOT_FOUND` | 该设备不存在指定费率版本（含用其他设备的版本号核算本设备班次） |
 | 422 | `RATE_ENTRY_INVALID` | 费率行非法：金额非十进制/为负/超 6 位小数、原因非法、区间缺时区/未对齐整分钟/倒置、同版本同原因重叠、空费率表；整批拒绝不留痕 |
+| 422 | `AMOUNT_OVERFLOW` | 定点金额超过数据库 BIGINT 金额列上界（`2^63-1` 分）：损失核算的任一定价明细/按原因汇总/账头合计，或期间结账的条目引用/按原因汇总/账头汇总越界；整笔回滚不留任何部分账、明细或结账（不截断、不饱和），已固化历史不改写；合法费率不因未来可能越界被拒 |
 | 404 | `LOSS_ACCOUNTING_NOT_FOUND` | 分摊引用的损失账不存在或不属于提交设备（含跨设备账 id） |
 | 422 | `ACCOUNTINGS_SAME_SHIFT` | 同一分摊单为同一班次引用了两份及以上损失账（每班至多一份） |
 | 422 | `BATCH_WINDOW_INVALID` | 批次窗口非法：批次号重复或窗口互相重叠（半开、相接允许） |
@@ -1114,6 +1130,37 @@ curl 'http://localhost:8000/shifts/1/loss-accountings?revision=1'
 # 金额为负 / 超 6 位小数 / 同原因区间重叠 / 空表 → 422 RATE_ENTRY_INVALID
 ```
 
+### 金额越界（`422 AMOUNT_OVERFLOW`，整笔回滚）
+
+费率每分钟金额允许最多 12 位整数（如 `999999999999` 元/分），**合法费率发布
+不预判未来班次长度**；但一条约 10 万分钟（约 69 天）的长班次配该费率时，逐段
+按分取整后的金额会超过 BIGINT（`2^63-1` 分）。此时核算在写入任何行之前即被
+拒绝，错误体仍为统一格式，重试结果不变：
+
+```bash
+# 合法的高费率可正常发布（不因"以后可能越界"被拒）
+curl -X POST http://localhost:8000/devices/CNC-01/rate-versions \
+  -H 'Content-Type: application/json' \
+  -d '{"entries":[{"reason":"failure",
+       "start":"2026-01-01T00:00:00+08:00","end":"2027-12-31T00:00:00+08:00",
+       "amount_per_minute":"999999999999"}]}'
+# 201 {"version":2, ...}
+
+# 对 100,000 分钟的已结算长班次核算 → 422（不截断、不饱和，不留账/明细）
+curl -i -X POST http://localhost:8000/shifts/7/loss-accountings \
+  -H 'Content-Type: application/json' -d '{"rate_version":2}'
+# HTTP/1.1 422 Unprocessable Entity
+# {"detail":{"code":"AMOUNT_OVERFLOW",
+#   "message":"loss accounting for shift id=7 revision 1 rate version 2 overflows ..."}}
+
+# 整笔已回滚：该班次查不到任何账；同组合再请求仍是同样的 422
+curl 'http://localhost:8000/shifts/7/loss-accountings'   # []
+```
+
+> 边界内（含恰好 `2^63-1` 分）的金额原样精确落库；待定价分钟没有金额，再长也
+> 不会触发越界。规避方式是业务侧拆分核算粒度（如按更短的修订/班次），而不是
+> 让服务饱和或截断金额。
+
 ## 按生产批次分摊停机成本（窗口交集、最大余数法分整数分、历史固化）
 
 车间按生产批次追溯停机成本时，把**同一设备**的一批已固化损失账，按一批批次号的
@@ -1296,6 +1343,11 @@ curl http://localhost:8000/devices/CNC-01/loss-cost-allocations
 - **任一**选中修订缺少固化归因段（结构引入前的历史修订）→
   `422 SEGMENTS_UNAVAILABLE`，**整单失败**：回滚后不留任何新损失账、条目或
   结账记录，绝不以当前状态推算；
+- **金额超过 BIGINT（`2^63-1` 分）**：每份纳入账自身在界内（核算固化时已
+  逐段校验），但多班次机械求和后整单合计或某原因汇总仍可能越界 →
+  `422 AMOUNT_OVERFLOW`，**整单失败**：结账头、全部条目及事务内为各班次
+  新建的损失账与切分明细一并回滚，**不留任何部分结果**（不截断、不饱和）；
+  此前已固化的历史账与历史结账原样保留、不改写；
 - **无符合班次时固化一张空结账**（`items=[]`、金额/分钟全 0），便于财务
   对空期间留痕；
 - 结账固化后，后续事件更正、裁定、费率发布或重新核算只产生**新修订/新费率/
@@ -1309,6 +1361,8 @@ curl http://localhost:8000/devices/CNC-01/loss-cost-allocations
   同单号**异输入**（设备/期间/截止序号/费率版本任一不同，时间按 UTC 归一比较）
   → `409 CLOSING_CONFLICT`；
 - 截止序号超过当前已提交最大序号 → `422 INVALID_SEQ`（`seq=0` 合法，得空结账）；
+- 整单金额（含条目引用、按原因汇总或账头合计）超过 BIGINT →
+  `422 AMOUNT_OVERFLOW`，整单回滚不留痕（详见[金额 BIGINT 上界](#停机损失费率版本按设备)）；
 - 未知设备 `404 DEVICE_NOT_FOUND`、该设备未知费率版本（含其他设备的版本号）
   `404 RATE_VERSION_NOT_FOUND`；
 - 期间缺时区 / 未对齐整分钟 / `start ≥ end`、`seq < 0` → `422 VALIDATION_ERROR`；
@@ -1403,6 +1457,29 @@ curl http://localhost:8000/devices/CNC-01/loss-closings
 # 历史修订无固化明细  → 422 SEGMENTS_UNAVAILABLE（整单不留痕）
 # 期间缺时区/start≥end → 422 VALIDATION_ERROR
 ```
+
+### 多班次结账金额越界（整单回滚，历史不改写）
+
+每份纳入损失账单独都在 BIGINT 界内时，多班次机械求和仍可能越界。下面两台
+各约 42 天（60,000 分钟）的长班次在费率 `999999999999` 元/分下，单份账约
+`5.99999×10^18` 分（界内），两账合计约 `1.19999×10^19` 分超过 `2^63-1`：
+
+```bash
+# 失败结账：422 AMOUNT_OVERFLOW，结账头/条目及事务内新建的损失账全部回滚
+curl -i -X POST http://localhost:8000/devices/CNC-01/loss-closings \
+  -H 'Content-Type: application/json' \
+  -d '{"device_id":"CNC-01","closing_no":"LC-BIG",
+       "start":"2026-09-01T00:00:00+08:00","end":"2027-03-01T00:00:00+08:00",
+       "seq":2,"rate_version":2}'
+# HTTP/1.1 422 Unprocessable Entity
+# {"detail":{"code":"AMOUNT_OVERFLOW","message":"period closing 'LC-BIG' total overflows ..."}}
+
+# 不留结账、条目，也不留事务内新建的损失账；同单号重试仍是同样的 422
+curl -i http://localhost:8000/loss-closings/LC-BIG   # 404 CLOSING_NOT_FOUND
+```
+
+> 此前已固化的历史损失账与历史结账不受影响、原样可读；缩短封存期间（减少纳入
+> 班次）后可正常结账，各账金额不截断、不饱和。
 
 ## 计划保养核对（按设备，按固定变更序号）
 

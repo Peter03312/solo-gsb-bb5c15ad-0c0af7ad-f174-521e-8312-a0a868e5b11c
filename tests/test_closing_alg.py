@@ -11,8 +11,11 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 from app.closing import (  # noqa: E402
     AccountSummary,
     empty_totals,
+    ensure_account_summary_fits,
+    ensure_totals_fit,
     summarize,
 )
+from app.pricing import DB_AMOUNT_MAX, AmountOverflowError  # noqa: E402
 
 
 def _reason(p=0, c=0, u=0):
@@ -121,6 +124,78 @@ def test_summarize_rejects_negative():
         pass
     else:  # pragma: no cover
         raise AssertionError("expected ValueError on negative totals")
+
+
+# ---------------------------------------------------------------- BIGINT 金额上界
+
+
+def _acc(total_cents, failure_cents=0, maintenance_cents=0):
+    return AccountSummary(
+        total_cents=total_cents,
+        priced_minutes=0,
+        unpriced_minutes=0,
+        by_reason={
+            "maintenance": _reason(c=maintenance_cents),
+            "failure": _reason(c=failure_cents),
+            "pending": _reason(),
+        },
+    )
+
+
+def test_ensure_account_summary_fit_boundary():
+    ensure_account_summary_fits(_acc(0))
+    ensure_account_summary_fits(_acc(DB_AMOUNT_MAX, failure_cents=DB_AMOUNT_MAX))
+    try:
+        ensure_account_summary_fits(_acc(DB_AMOUNT_MAX + 1))
+    except AmountOverflowError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("expected AmountOverflowError")
+
+
+def test_ensure_account_summary_fit_detects_by_reason_overflow():
+    # 账头标量在界内但按原因汇总越界也拒绝
+    try:
+        ensure_account_summary_fits(
+            AccountSummary(
+                total_cents=DB_AMOUNT_MAX + 1,
+                priced_minutes=0,
+                unpriced_minutes=0,
+                by_reason={"failure": _reason(c=DB_AMOUNT_MAX + 1)},
+            )
+        )
+    except AmountOverflowError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("expected AmountOverflowError")
+
+
+def test_closing_total_overflow_across_accounts_rejected():
+    # 每份账自身在界内（核算固化时已过同界校验），机械求和后整单越界：
+    # 不截断、不饱和，抛 AmountOverflowError 由写路径转 422、整单回滚。
+    accounts = [
+        _acc(5 * 10**18, failure_cents=5 * 10**18),
+        _acc(5 * 10**18, failure_cents=5 * 10**18),
+    ]
+    totals = summarize(accounts)
+    assert totals.total_cents == 10**19
+    try:
+        ensure_totals_fit(totals)
+    except AmountOverflowError:
+        pass
+    else:  # pragma: no cover
+        raise AssertionError("expected AmountOverflowError on closing total")
+
+
+def test_closing_totals_in_bounds_pass_unchanged():
+    # 边界内金额原样通过、精确保留（无取整/饱和）
+    accounts = [
+        _acc(10**18, failure_cents=10**18),
+        _acc(DB_AMOUNT_MAX - 10**18, failure_cents=DB_AMOUNT_MAX - 10**18),
+    ]
+    totals = summarize(accounts)
+    ensure_totals_fit(totals)
+    assert totals.total_cents == DB_AMOUNT_MAX
 
 
 if __name__ == "__main__":
